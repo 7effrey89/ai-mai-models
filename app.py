@@ -123,21 +123,90 @@ tab_transcribe, tab_voice, tab_image = st.tabs(
 )
 
 # ===========================================================================
+# Helper – call MAI-Transcribe-1 API and render result
+# ===========================================================================
+def _run_transcription(audio_bytes: bytes, filename: str, mime: str, locale: str) -> None:
+    """Send *audio_bytes* to MAI-Transcribe-1 and render the transcript."""
+    if not speech_key or not speech_region:
+        st.error("Please provide your Azure Speech Key and Region in the sidebar.")
+        return
+
+    with st.spinner("Transcribing with MAI-Transcribe-1…"):
+        try:
+            validated_region = _validate_speech_region(speech_region)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
+        # MAI-Transcribe-1 is accessed via the Azure LLM Speech API.
+        # api-version=2025-10-15 is the version that introduces the
+        # `enhancedMode` field used to select the mai-transcribe-1 model.
+        endpoint = (
+            f"https://{validated_region}.api.cognitive.microsoft.com"
+            "/speechtotext/transcriptions:transcribe"
+            "?api-version=2025-10-15"
+        )
+
+        definition = json.dumps(
+            {
+                "locales": [locale],
+                "enhancedMode": {
+                    "enabled": True,
+                    "model": "mai-transcribe-1",  # selects MAI-Transcribe-1 specifically
+                },
+            }
+        )
+
+        try:
+            response = requests.post(
+                endpoint,
+                headers={"Ocp-Apim-Subscription-Key": speech_key},
+                files={
+                    "audio": (filename, audio_bytes, mime),
+                    "definition": (None, definition, "application/json"),
+                },
+                timeout=120,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # The API returns combinedPhrases or phrases
+            combined = result.get("combinedPhrases", [])
+            if combined:
+                transcript = " ".join(p.get("text", "") for p in combined)
+            else:
+                phrases = result.get("phrases", [])
+                transcript = " ".join(p.get("text", "") for p in phrases)
+
+            if transcript:
+                st.success("Transcription complete!")
+                st.text_area("Transcript", value=transcript, height=200)
+            else:
+                st.warning("No transcript text was returned. Raw response:")
+                st.json(result)
+
+        except requests.HTTPError as exc:
+            st.error(f"API error {exc.response.status_code}: {exc.response.text}")
+        except Exception as exc:
+            st.error(f"Unexpected error: {exc}")
+
+
+# ===========================================================================
 # TAB 1 – MAI-Transcribe-1  (speech → text)
 # ===========================================================================
 with tab_transcribe:
     st.header("MAI-Transcribe-1 — Speech to Text")
-    st.markdown(
-        "Upload an audio file (WAV, MP3, or FLAC, max 300 MB) and MAI-Transcribe-1 "
-        "will transcribe it for you."
-    )
-
-    audio_file = st.file_uploader(
-        "Upload audio file", type=["wav", "mp3", "flac", "ogg", "m4a"]
+    st.info(
+        "**How it works:** MAI-Transcribe-1 is accessed via the Azure LLM Speech API "
+        "(`api-version=2025-10-15`). The model is explicitly selected by setting "
+        "`enhancedMode.model = \"mai-transcribe-1\"` in the request, which distinguishes "
+        "it from the standard Azure Speech transcription model. "
+        "Supported audio formats: WAV, MP3, FLAC (max 300 MB).",
+        icon="ℹ️",
     )
 
     transcribe_language = st.selectbox(
-        "Language hint (optional)",
+        "Language hint",
         options=[
             "en-US",
             "en-GB",
@@ -158,73 +227,43 @@ with tab_transcribe:
         index=0,
     )
 
-    if st.button("Transcribe", type="primary", disabled=audio_file is None):
-        if not speech_key or not speech_region:
-            st.error("Please provide your Azure Speech Key and Region in the sidebar.")
-        else:
-            with st.spinner("Transcribing with MAI-Transcribe-1…"):
-                try:
-                    validated_region = _validate_speech_region(speech_region)
-                except ValueError as exc:
-                    st.error(str(exc))
-                    st.stop()
+    input_col1, input_col2 = st.columns(2)
 
-                endpoint = (
-                    f"https://{validated_region}.api.cognitive.microsoft.com"
-                    "/speechtotext/transcriptions:transcribe"
-                    "?api-version=2025-10-15"
-                )
+    # ------------------------------------------------------------------
+    # Option A – Record from microphone
+    # ------------------------------------------------------------------
+    with input_col1:
+        st.subheader("🎤 Record from microphone")
+        st.caption(
+            "Click the microphone icon to start recording. "
+            "Click stop when you're done — transcription starts automatically."
+        )
+        mic_audio = st.audio_input("Record audio", label_visibility="collapsed")
+        if mic_audio is not None:
+            _run_transcription(
+                audio_bytes=mic_audio.getvalue(),
+                filename="recording.wav",
+                mime="audio/wav",
+                locale=transcribe_language,
+            )
 
-                definition = json.dumps(
-                    {
-                        "locales": [transcribe_language],
-                        "enhancedMode": {
-                            "enabled": True,
-                            "model": "mai-transcribe-1",
-                        },
-                    }
-                )
-
-                try:
-                    response = requests.post(
-                        endpoint,
-                        headers={"Ocp-Apim-Subscription-Key": speech_key},
-                        files={
-                            "audio": (
-                                audio_file.name,
-                                audio_file.getvalue(),
-                                audio_file.type or "audio/wav",
-                            ),
-                            "definition": (None, definition, "application/json"),
-                        },
-                        timeout=120,
-                    )
-                    response.raise_for_status()
-                    result = response.json()
-
-                    # The API returns combinedPhrases or phrases
-                    combined = result.get("combinedPhrases", [])
-                    if combined:
-                        transcript = " ".join(p.get("text", "") for p in combined)
-                    else:
-                        phrases = result.get("phrases", [])
-                        transcript = " ".join(p.get("text", "") for p in phrases)
-
-                    if transcript:
-                        st.success("Transcription complete!")
-                        st.text_area("Transcript", value=transcript, height=200)
-                    else:
-                        st.warning(
-                            "No transcript text was returned. Raw response:"
-                        )
-                        st.json(result)
-
-                except requests.HTTPError as exc:
-                    st.error(
-                        f"API error {exc.response.status_code}: {exc.response.text}"
-                    )
-                except Exception as exc:
-                    st.error(f"Unexpected error: {exc}")
+    # ------------------------------------------------------------------
+    # Option B – Upload an existing audio file
+    # ------------------------------------------------------------------
+    with input_col2:
+        st.subheader("📂 Upload an audio file")
+        audio_file = st.file_uploader(
+            "Upload audio file",
+            type=["wav", "mp3", "flac", "ogg", "m4a"],
+            label_visibility="collapsed",
+        )
+        if st.button("Transcribe uploaded file", type="primary", disabled=audio_file is None):
+            _run_transcription(
+                audio_bytes=audio_file.getvalue(),
+                filename=audio_file.name,
+                mime=audio_file.type or "audio/wav",
+                locale=transcribe_language,
+            )
 
 # ===========================================================================
 # TAB 2 – MAI-Voice-1  (text → speech)

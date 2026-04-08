@@ -4,7 +4,7 @@ A Streamlit playground for testing the three new Microsoft Foundry MAI models:
 
 | Model | Capability |
 |---|---|
-| **MAI-Transcribe-1** | Speech-to-text – transcribes audio in 25+ languages |
+| **MAI-Transcribe-1** | Speech-to-text – record from mic or upload a file, transcribes in 25+ languages |
 | **MAI-Voice-1** | Text-to-speech – expressive, natural neural voices |
 | **MAI-Image-2** | Text-to-image – high-quality diffusion-based image generation |
 
@@ -67,6 +67,8 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 ### MAI-Transcribe-1 & MAI-Voice-1
 
 Both models are available through the **Azure Speech Service**. Create a Speech resource in the [Azure portal](https://portal.azure.com) and note the **key** and **region**.
+
+**About the API version:** `api-version=2025-10-15` is the correct, up-to-date version of the LLM Speech API that supports MAI-Transcribe-1. The model is explicitly selected in the request body with `enhancedMode.model = "mai-transcribe-1"`, which is what distinguishes it from the standard Azure Speech transcription model.
 
 - [MAI-Transcribe-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe)
 - [MAI-Voice-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-voices)

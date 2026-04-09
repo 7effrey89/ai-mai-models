@@ -87,6 +87,33 @@ def _normalize_tenant_id(tenant_id: str) -> str:
     return tenant_id.strip()
 
 
+def _normalize_resource_id(resource_id: str) -> str:
+    """Normalize an optional Azure resource ID."""
+    return resource_id.strip()
+
+
+def _normalize_speech_endpoint(endpoint: str) -> str:
+    """Normalize an optional Speech TTS endpoint override."""
+    normalized = endpoint.strip().rstrip("/")
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(
+            "Invalid Azure Speech Endpoint override. "
+            "Expected a URL like https://eastus.tts.speech.microsoft.com/cognitiveservices/v1."
+        )
+
+    if parsed.path and parsed.path != "/cognitiveservices/v1":
+        raise ValueError(
+            "Invalid Azure Speech Endpoint override path. "
+            "Expected either the host root or /cognitiveservices/v1."
+        )
+
+    return f"https://{parsed.netloc}/cognitiveservices/v1"
+
+
 @st.cache_resource
 def _get_default_credential(tenant_id: str):
     """Create a cached Azure credential chain on demand."""
@@ -161,6 +188,56 @@ def _build_foundry_headers(auth_method: str, api_key: str, tenant_id: str) -> di
     return headers
 
 
+def _build_tts_endpoint(speech_endpoint: str, speech_region: str) -> str:
+    """Build the MAI-Voice-1 REST endpoint."""
+    normalized_endpoint = _normalize_speech_endpoint(speech_endpoint)
+    if normalized_endpoint:
+        return normalized_endpoint
+
+    validated_region = _validate_speech_region(speech_region)
+    return f"https://{validated_region}.tts.speech.microsoft.com/cognitiveservices/v1"
+
+
+def _build_tts_headers(
+    subscription_key: str,
+    output_format: str,
+    tenant_id: str,
+    resource_id: str,
+) -> dict[str, str]:
+    """Build headers for MAI-Voice-1 text-to-speech requests."""
+    headers = {
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": output_format,
+        "User-Agent": "MAI-Playground",
+    }
+
+    key = subscription_key.strip()
+    if key:
+        headers["Ocp-Apim-Subscription-Key"] = key
+        return headers
+
+    normalized_resource_id = _normalize_resource_id(resource_id)
+    normalized_tenant_id = _normalize_tenant_id(tenant_id)
+    if not normalized_resource_id or not normalized_tenant_id:
+        raise ValueError(
+            "Azure Default authentication for MAI-Voice-1 requires both Azure Tenant ID "
+            "and Azure Speech Resource ID."
+        )
+
+    try:
+        entra_token = _get_default_credential(normalized_tenant_id).get_token(
+            _FOUNDRY_TOKEN_SCOPE
+        ).token
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to acquire a Microsoft Entra token for MAI-Voice-1. "
+            f"{exc}"
+        ) from exc
+
+    headers["Authorization"] = f"Bearer aad#{normalized_resource_id}#{entra_token}"
+    return headers
+
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -196,6 +273,22 @@ with st.sidebar:
         "Azure Speech Region",
         value=os.getenv("AZURE_SPEECH_REGION", "eastus"),
         help='E.g. "eastus", "westeurope".',
+    )
+    speech_endpoint = st.text_input(
+        "Azure Speech TTS Endpoint",
+        value=os.getenv("AZURE_SPEECH_ENDPOINT", ""),
+        help=(
+            "Optional override for MAI-Voice-1. Leave blank to use the regional "
+            "endpoint https://<region>.tts.speech.microsoft.com/cognitiveservices/v1."
+        ),
+    )
+    speech_resource_id = st.text_input(
+        "Azure Speech Resource ID",
+        value=os.getenv("AZURE_SPEECH_RESOURCE_ID", ""),
+        help=(
+            "Required for MAI-Voice-1 when using Azure Default authentication. "
+            "Example: /subscriptions/.../providers/Microsoft.CognitiveServices/accounts/<resource>."
+        ),
     )
     openai_endpoint = st.text_input(
         "Azure AI Foundry Endpoint",
@@ -453,22 +546,24 @@ with tab_voice:
     )
 
     if st.button("Synthesise", type="primary"):
-        if not speech_key or not speech_region:
-            st.error("Please provide your Azure Speech Key and Region in the sidebar.")
-        elif not tts_text.strip():
+        if not tts_text.strip():
             st.warning("Please enter some text to synthesise.")
         else:
             with st.spinner("Synthesising with MAI-Voice-1…"):
                 try:
-                    validated_region = _validate_speech_region(speech_region)
+                    tts_endpoint = _build_tts_endpoint(speech_endpoint, speech_region)
+                    tts_headers = _build_tts_headers(
+                        speech_key,
+                        output_format,
+                        foundry_tenant_id,
+                        speech_resource_id,
+                    )
                 except ValueError as exc:
                     st.error(str(exc))
                     st.stop()
-
-                tts_endpoint = (
-                    f"https://{validated_region}.tts.speech.microsoft.com"
-                    "/cognitiveservices/v1"
-                )
+                except RuntimeError as exc:
+                    st.error(str(exc))
+                    st.stop()
 
                 ssml = (
                     '<speak version="1.0" '
@@ -483,12 +578,7 @@ with tab_voice:
                 try:
                     tts_response = requests.post(
                         tts_endpoint,
-                        headers={
-                            "Ocp-Apim-Subscription-Key": speech_key,
-                            "Content-Type": "application/ssml+xml",
-                            "X-Microsoft-OutputFormat": output_format,
-                            "User-Agent": "MAI-Playground",
-                        },
+                        headers=tts_headers,
                         data=ssml.encode("utf-8"),
                         timeout=60,
                     )

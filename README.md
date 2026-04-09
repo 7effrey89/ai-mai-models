@@ -48,7 +48,8 @@ cp .env.example .env
 |---|---|
 | `AZURE_SPEECH_KEY` | Azure Speech resource key (MAI-Transcribe-1 & MAI-Voice-1) |
 | `AZURE_SPEECH_REGION` | Azure region, e.g. `eastus` |
-| `AZURE_SPEECH_ENDPOINT` | Optional MAI-Voice-1 TTS endpoint override. If unset, the app uses `https://<region>.tts.speech.microsoft.com/cognitiveservices/v1` |
+| `AZURE_SPEECH_ENDPOINT` | Optional Speech resource endpoint for MAI-Transcribe-1, e.g. `https://<resource>.cognitiveservices.azure.com/` |
+| `AZURE_SPEECH_TTS_ENDPOINT` | Optional MAI-Voice-1 TTS endpoint override. If unset, the app uses `https://<region>.tts.speech.microsoft.com/cognitiveservices/v1` |
 | `AZURE_SPEECH_RESOURCE_ID` | Speech resource ID used to construct Entra-authenticated MAI-Voice-1 bearer tokens |
 | `AZURE_FOUNDRY_ENDPOINT` | Foundry endpoint URL for MAI-Image-2. Can be either `https://<resource>.services.ai.azure.com` or `https://<resource>.services.ai.azure.com/api/projects/<project>` |
 | `AZURE_FOUNDRY_AUTH_METHOD` | `azuredefault` or `api-key` |
@@ -72,13 +73,17 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ### MAI-Transcribe-1 & MAI-Voice-1
 
-Both models are available through the **Azure Speech Service**. Create a Speech resource in the [Azure portal](https://portal.azure.com) and note the **key** and **region**.
+MAI-Voice-1 uses the **Azure Speech Service**. Create a Speech resource in the [Azure portal](https://portal.azure.com) and note the region. You can authenticate either with a speech key or with Microsoft Entra ID plus the speech resource ID.
+
+MAI-Transcribe-1 uses the Azure Speech LLM API. If you have a resource endpoint such as `https://jlafoundryeastus.cognitiveservices.azure.com/`, set `AZURE_SPEECH_ENDPOINT`; otherwise the app falls back to the regional endpoint built from `AZURE_SPEECH_REGION`.
+
+The app first tries `AZURE_SPEECH_KEY`. If key-based auth is disabled on the Speech resource, it automatically retries with Azure Default Credential using `AZURE_TENANT_ID`.
 
 For **MAI-Voice-1** with Microsoft Entra authentication, the app can also use your Azure identity instead of a speech key. In that mode it sends `Authorization: Bearer aad#<resource-id>#<entra-token>` to the regional Speech TTS endpoint and requires `AZURE_SPEECH_RESOURCE_ID` plus `AZURE_TENANT_ID`.
 
 By default, the app uses the regional TTS endpoint format `https://<speech-region>.tts.speech.microsoft.com/cognitiveservices/v1`. If your Speech resource exposes a different TTS endpoint, set `AZURE_SPEECH_ENDPOINT` to override it explicitly.
 
-**About the API version:** `api-version=2025-10-15` is the correct, up-to-date version of the LLM Speech API that supports MAI-Transcribe-1. The model is explicitly selected in the request body with `enhancedMode.model = "mai-transcribe-1"`, which is what distinguishes it from the standard Azure Speech transcription model.
+For transcription, the app calls `POST /speechtotext/transcriptions:transcribe?api-version=2025-10-15` and sets `enhancedMode.model = "mai-transcribe-1"`.
 
 - [MAI-Transcribe-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe)
 - [MAI-Voice-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-voices)

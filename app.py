@@ -63,6 +63,15 @@ def _normalize_foundry_endpoint(endpoint: str) -> str:
     return f"https://{parsed.netloc}"
 
 
+def _build_openai_inference_endpoint(foundry_endpoint: str) -> str:
+    """Convert a Foundry resource or project endpoint to its OpenAI inference host."""
+    normalized_endpoint = _normalize_foundry_endpoint(foundry_endpoint)
+    host = urlparse(normalized_endpoint).netloc.replace(
+        ".services.ai.azure.com", ".openai.azure.com"
+    )
+    return f"https://{host}"
+
+
 def _parse_image_size(size: str) -> tuple[int, int]:
     """Convert a WIDTHxHEIGHT UI value into numeric dimensions."""
     width_str, height_str = size.split("x", maxsplit=1)
@@ -92,7 +101,29 @@ def _normalize_resource_id(resource_id: str) -> str:
     return resource_id.strip()
 
 
-def _normalize_speech_endpoint(endpoint: str) -> str:
+def _normalize_speech_service_endpoint(endpoint: str) -> str:
+    """Normalize an optional Azure Speech service endpoint."""
+    normalized = endpoint.strip().rstrip("/")
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(
+            "Invalid Azure Speech Endpoint. "
+            "Expected a URL like https://<resource>.cognitiveservices.azure.com."
+        )
+
+    if parsed.path and parsed.path != "/":
+        raise ValueError(
+            "Invalid Azure Speech Endpoint path. "
+            "Expected the resource root URL such as https://<resource>.cognitiveservices.azure.com/."
+        )
+
+    return f"https://{parsed.netloc}"
+
+
+def _normalize_speech_tts_endpoint(endpoint: str) -> str:
     """Normalize an optional Speech TTS endpoint override."""
     normalized = endpoint.strip().rstrip("/")
     if not normalized:
@@ -101,13 +132,13 @@ def _normalize_speech_endpoint(endpoint: str) -> str:
     parsed = urlparse(normalized)
     if parsed.scheme != "https" or not parsed.netloc:
         raise ValueError(
-            "Invalid Azure Speech Endpoint override. "
+            "Invalid Azure Speech TTS Endpoint override. "
             "Expected a URL like https://eastus.tts.speech.microsoft.com/cognitiveservices/v1."
         )
 
     if parsed.path and parsed.path != "/cognitiveservices/v1":
         raise ValueError(
-            "Invalid Azure Speech Endpoint override path. "
+            "Invalid Azure Speech TTS Endpoint override path. "
             "Expected either the host root or /cognitiveservices/v1."
         )
 
@@ -188,9 +219,32 @@ def _build_foundry_headers(auth_method: str, api_key: str, tenant_id: str) -> di
     return headers
 
 
-def _build_tts_endpoint(speech_endpoint: str, speech_region: str) -> str:
+def _build_transcription_headers(subscription_key: str, tenant_id: str) -> dict[str, str]:
+    """Build headers for MAI-Transcribe-1 requests."""
+    key = subscription_key.strip()
+    if key:
+        return {"Ocp-Apim-Subscription-Key": key}
+
+    normalized_tenant_id = _normalize_tenant_id(tenant_id)
+    if not normalized_tenant_id:
+        raise ValueError(
+            "Provide either an Azure Speech Key or an Azure Tenant ID for Azure Default Credential."
+        )
+
+    try:
+        token = _get_default_credential(normalized_tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to acquire a Microsoft Entra token for MAI-Transcribe-1. "
+            f"{exc}"
+        ) from exc
+
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _build_tts_endpoint(speech_tts_endpoint: str, speech_region: str) -> str:
     """Build the MAI-Voice-1 REST endpoint."""
-    normalized_endpoint = _normalize_speech_endpoint(speech_endpoint)
+    normalized_endpoint = _normalize_speech_tts_endpoint(speech_tts_endpoint)
     if normalized_endpoint:
         return normalized_endpoint
 
@@ -275,8 +329,16 @@ with st.sidebar:
         help='E.g. "eastus", "westeurope".',
     )
     speech_endpoint = st.text_input(
-        "Azure Speech TTS Endpoint",
+        "Azure Speech Endpoint",
         value=os.getenv("AZURE_SPEECH_ENDPOINT", ""),
+        help=(
+            "Optional Speech resource endpoint for MAI-Transcribe-1, for example "
+            "https://<resource>.cognitiveservices.azure.com/."
+        ),
+    )
+    speech_tts_endpoint = st.text_input(
+        "Azure Speech TTS Endpoint",
+        value=os.getenv("AZURE_SPEECH_TTS_ENDPOINT", ""),
         help=(
             "Optional override for MAI-Voice-1. Leave blank to use the regional "
             "endpoint https://<region>.tts.speech.microsoft.com/cognitiveservices/v1."
@@ -314,11 +376,12 @@ with st.sidebar:
         "API Key": "api-key",
     }
     foundry_auth_label = st.selectbox(
-        "MAI-Image-2 Auth Method",
+        "Foundry Auth Method",
         options=list(foundry_auth_options.keys()),
         index=0 if normalized_auth_method == "azuredefault" else 1,
         help=(
-            "Use Azure Default Credential for Entra ID auth, or API Key if your "
+            "Used by Foundry-backed MAI-Transcribe-1 and MAI-Image-2 requests. "
+            "Choose Azure Default Credential for Entra ID auth, or API Key if your "
             "resource is configured for key-based access."
         ),
     )
@@ -344,7 +407,6 @@ with st.sidebar:
         value=os.getenv("AZURE_FOUNDRY_DEPLOYMENT", os.getenv("AZURE_OPENAI_DEPLOYMENT", "mai-image-2")),
         help="The deployment name you chose when deploying MAI-Image-2 in Foundry.",
     )
-
     st.divider()
     st.markdown(
         "**Resources**\n"
@@ -366,56 +428,61 @@ tab_transcribe, tab_voice, tab_image = st.tabs(
 # ===========================================================================
 def _run_transcription(audio_bytes: bytes, filename: str, mime: str, locale: str) -> None:
     """Send *audio_bytes* to MAI-Transcribe-1 and render the transcript."""
-    if not speech_key or not speech_region:
-        st.error("Please provide your Azure Speech Key and Region in the sidebar.")
-        return
-
     with st.spinner("Transcribing with MAI-Transcribe-1…"):
         try:
-            validated_region = _validate_speech_region(speech_region)
-        except ValueError as exc:
-            st.error(str(exc))
-            return
+            normalized_speech_endpoint = _normalize_speech_service_endpoint(speech_endpoint)
+            if normalized_speech_endpoint:
+                endpoint = (
+                    f"{normalized_speech_endpoint}/speechtotext/transcriptions:transcribe"
+                    "?api-version=2025-10-15"
+                )
+            else:
+                validated_region = _validate_speech_region(speech_region)
+                endpoint = (
+                    f"https://{validated_region}.api.cognitive.microsoft.com"
+                    "/speechtotext/transcriptions:transcribe"
+                    "?api-version=2025-10-15"
+                )
 
-        # MAI-Transcribe-1 is accessed via the Azure LLM Speech API.
-        # api-version=2025-10-15 is the version that introduces the
-        # `enhancedMode` field used to select the mai-transcribe-1 model.
-        endpoint = (
-            f"https://{validated_region}.api.cognitive.microsoft.com"
-            "/speechtotext/transcriptions:transcribe"
-            "?api-version=2025-10-15"
-        )
-
-        definition = json.dumps(
-            {
-                "locales": [locale],
-                "enhancedMode": {
-                    "enabled": True,
-                    "model": "mai-transcribe-1",  # selects MAI-Transcribe-1 specifically
-                },
-            }
-        )
-
-        try:
-            response = requests.post(
-                endpoint,
-                headers={"Ocp-Apim-Subscription-Key": speech_key},
-                files={
-                    "audio": (filename, audio_bytes, mime),
-                    "definition": (None, definition, "application/json"),
-                },
-                timeout=120,
+            definition = json.dumps(
+                {
+                    "locales": [locale],
+                    "enhancedMode": {
+                        "enabled": True,
+                        "task": "transcribe",
+                        "model": "mai-transcribe-1",
+                    },
+                }
             )
+            files = {
+                "audio": (filename, audio_bytes, mime),
+                "definition": (None, definition, "application/json"),
+            }
+
+            headers = _build_transcription_headers(speech_key, foundry_tenant_id)
+            response = requests.post(endpoint, headers=headers, files=files, timeout=120)
+
+            # Some Speech resources disable key auth entirely. In that case, retry with Entra.
+            if (
+                response.status_code == 403
+                and "AuthenticationTypeDisabled" in response.text
+                and headers.get("Ocp-Apim-Subscription-Key")
+            ):
+                headers = _build_transcription_headers("", foundry_tenant_id)
+                response = requests.post(endpoint, headers=headers, files=files, timeout=120)
+
             response.raise_for_status()
             result = response.json()
 
-            # The API returns combinedPhrases or phrases
-            combined = result.get("combinedPhrases", [])
-            if combined:
-                transcript = " ".join(p.get("text", "") for p in combined)
+            if result.get("text"):
+                transcript = result.get("text", "")
             else:
-                phrases = result.get("phrases", [])
-                transcript = " ".join(p.get("text", "") for p in phrases)
+                combined = result.get("combinedPhrases", [])
+                if combined:
+                    transcript = " ".join(p.get("text", "") for p in combined)
+                else:
+                    phrases = result.get("phrases", [])
+                    transcript = " ".join(p.get("text", "") for p in phrases)
 
             if transcript:
                 st.success("Transcription complete!")
@@ -436,11 +503,12 @@ def _run_transcription(audio_bytes: bytes, filename: str, mime: str, locale: str
 with tab_transcribe:
     st.header("MAI-Transcribe-1 — Speech to Text")
     st.info(
-        "**How it works:** MAI-Transcribe-1 is accessed via the Azure LLM Speech API "
-        "(`api-version=2025-10-15`). The model is explicitly selected by setting "
-        "`enhancedMode.model = \"mai-transcribe-1\"` in the request, which distinguishes "
-        "it from the standard Azure Speech transcription model. "
-        "Supported audio formats: WAV, MP3, FLAC (max 300 MB).",
+        "**How it works:** MAI-Transcribe-1 uses the Azure Speech LLM API at "
+        "`/speechtotext/transcriptions:transcribe?api-version=2025-10-15` with your Speech "
+        "resource credentials. If `Azure Speech Endpoint` is set, the app uses that resource endpoint; "
+        "otherwise it falls back to `https://<region>.api.cognitive.microsoft.com`. "
+        "The request sets `enhancedMode.model = \"mai-transcribe-1\"` and `task = \"transcribe\"`. "
+        "If key auth is disabled on the Speech resource, the app retries with Azure Default Credential.",
         icon="ℹ️",
     )
 
@@ -523,6 +591,7 @@ with tab_voice:
 
     # Known MAI-Voice-1 voices (en-US only for now)
     voice_options = {
+        "Grant (en-US)": "en-US-Grant:MAI-Voice-1",
         "Teo (en-US)": "en-US-Teo:MAI-Voice-1",
         "Ava (en-US)": "en-US-Ava:MAI-Voice-1",
         "Andrew (en-US)": "en-US-Andrew:MAI-Voice-1",
@@ -531,7 +600,7 @@ with tab_voice:
         "Jenny (en-US)": "en-US-Jenny:MAI-Voice-1",
     }
 
-    selected_voice_label = st.selectbox("Voice", options=list(voice_options.keys()))
+    selected_voice_label = st.selectbox("Voice", options=list(voice_options.keys()), index=0)
     selected_voice = voice_options[selected_voice_label]
 
     output_format = st.selectbox(
@@ -551,7 +620,7 @@ with tab_voice:
         else:
             with st.spinner("Synthesising with MAI-Voice-1…"):
                 try:
-                    tts_endpoint = _build_tts_endpoint(speech_endpoint, speech_region)
+                    tts_endpoint = _build_tts_endpoint(speech_tts_endpoint, speech_region)
                     tts_headers = _build_tts_headers(
                         speech_key,
                         output_format,

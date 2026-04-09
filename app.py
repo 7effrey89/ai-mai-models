@@ -12,6 +12,8 @@ import io
 import json
 import os
 import re
+import threading
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -240,6 +242,147 @@ def _build_transcription_headers(subscription_key: str, tenant_id: str) -> dict[
         ) from exc
 
     return {"Authorization": f"Bearer {token}"}
+
+
+def _get_speechsdk_module():
+    """Import the Azure Speech SDK lazily."""
+    try:
+        return importlib.import_module("azure.cognitiveservices.speech")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Real-time transcription requires the 'azure-cognitiveservices-speech' package. "
+            "Install it from requirements.txt and restart the app."
+        ) from exc
+
+
+def _build_realtime_speech_config(locale: str):
+    """Create a Speech SDK config for microphone-based real-time transcription."""
+    speechsdk = _get_speechsdk_module()
+    normalized_locale = locale.strip()
+
+    key = speech_key.strip()
+    if key:
+        validated_region = _validate_speech_region(speech_region)
+        speech_config = speechsdk.SpeechConfig(subscription=key, region=validated_region)
+        speech_config.speech_recognition_language = normalized_locale
+        return speechsdk, speech_config
+
+    normalized_tenant_id = _normalize_tenant_id(foundry_tenant_id)
+    normalized_resource_id = _normalize_resource_id(speech_resource_id)
+    if not normalized_tenant_id or not normalized_resource_id:
+        raise ValueError(
+            "Real-time transcription without a Speech key requires both Azure Tenant ID "
+            "and Azure Speech Resource ID."
+        )
+
+    try:
+        token = _get_default_credential(normalized_tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to acquire a Microsoft Entra token for real-time transcription. "
+            f"{exc}"
+        ) from exc
+
+    normalized_speech_endpoint = _normalize_speech_service_endpoint(speech_endpoint)
+    if normalized_speech_endpoint:
+        endpoint = normalized_speech_endpoint
+    else:
+        validated_region = _validate_speech_region(speech_region)
+        endpoint = f"https://{validated_region}.api.cognitive.microsoft.com"
+
+    speech_config = speechsdk.SpeechConfig(endpoint=endpoint)
+    speech_config.authorization_token = f"aad#{normalized_resource_id}#{token}"
+    speech_config.speech_recognition_language = normalized_locale
+    return speechsdk, speech_config
+
+
+def _run_realtime_transcription_attempt(locale: str, duration_seconds: int) -> None:
+    """Run a fixed-window, best-effort real-time transcription attempt from the default mic."""
+    speechsdk, speech_config = _build_realtime_speech_config(locale)
+    audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+    speech_recognizer = speechsdk.SpeechRecognizer(
+        speech_config=speech_config,
+        audio_config=audio_config,
+    )
+
+    recognized_segments: list[str] = []
+    partial_text = ""
+    error_message = ""
+    recognition_completed = threading.Event()
+
+    def _handle_recognizing(event):
+        nonlocal partial_text
+        if event.result.text:
+            partial_text = event.result.text
+
+    def _handle_recognized(event):
+        nonlocal partial_text
+        if event.result.reason == speechsdk.ResultReason.RecognizedSpeech and event.result.text:
+            recognized_segments.append(event.result.text)
+            partial_text = ""
+
+    def _handle_canceled(event):
+        nonlocal error_message
+        details = getattr(event, "cancellation_details", None)
+        if details and getattr(details, "error_details", None):
+            error_message = details.error_details
+        else:
+            error_message = str(event)
+        recognition_completed.set()
+
+    def _handle_session_stopped(_event):
+        recognition_completed.set()
+
+    speech_recognizer.recognizing.connect(_handle_recognizing)
+    speech_recognizer.recognized.connect(_handle_recognized)
+    speech_recognizer.canceled.connect(_handle_canceled)
+    speech_recognizer.session_stopped.connect(_handle_session_stopped)
+
+    status_placeholder = st.empty()
+    transcript_placeholder = st.empty()
+
+    def _render_realtime_transcript(lines: list[str]) -> None:
+        transcript_text = "\n".join(lines).strip()
+        if transcript_text:
+            transcript_placeholder.code(transcript_text, language="text")
+        else:
+            transcript_placeholder.info("Waiting for recognized speech...", icon="📝")
+
+    try:
+        speech_recognizer.start_continuous_recognition_async().get()
+        started_at = time.monotonic()
+
+        while time.monotonic() - started_at < duration_seconds and not recognition_completed.is_set():
+            seconds_remaining = max(0, int(duration_seconds - (time.monotonic() - started_at)))
+            status_placeholder.info(
+                f"Listening from the default microphone for up to {seconds_remaining} more seconds...",
+                icon="🎙️",
+            )
+
+            live_lines = list(recognized_segments)
+            if partial_text:
+                live_lines.append(f"[{partial_text}]")
+
+            _render_realtime_transcript(live_lines)
+            time.sleep(0.25)
+    finally:
+        speech_recognizer.stop_continuous_recognition_async().get()
+
+    if error_message:
+        st.error(f"Real-time transcription failed: {error_message}")
+        return
+
+    final_lines = list(recognized_segments)
+    if partial_text:
+        final_lines.append(partial_text)
+
+    if final_lines:
+        status_placeholder.success("Real-time transcription attempt complete.")
+        _render_realtime_transcript(final_lines)
+    else:
+        status_placeholder.warning(
+            "No speech was recognized from the default microphone during the listening window."
+        )
 
 
 def _build_tts_endpoint(speech_tts_endpoint: str, speech_region: str) -> str:
@@ -571,6 +714,30 @@ with tab_transcribe:
                 mime=audio_file.type or "audio/wav",
                 locale=transcribe_language,
             )
+
+    st.divider()
+    st.subheader("⚡ Experimental Real-Time Attempt")
+    st.caption(
+        "Best-effort microphone transcription using the Azure Speech SDK on the machine running "
+        "this Streamlit app. This is a fixed-window real-time attempt, not the file-based MAI-Transcribe REST call."
+    )
+    realtime_duration_seconds = st.slider(
+        "Listening window (seconds)",
+        min_value=5,
+        max_value=30,
+        value=10,
+        key="realtime_duration_seconds",
+    )
+    if st.button("Start real-time attempt", type="secondary"):
+        try:
+            _run_realtime_transcription_attempt(
+                locale=transcribe_language,
+                duration_seconds=realtime_duration_seconds,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+        except RuntimeError as exc:
+            st.error(str(exc))
 
 # ===========================================================================
 # TAB 2 – MAI-Voice-1  (text → speech)

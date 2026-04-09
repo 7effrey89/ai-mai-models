@@ -85,6 +85,8 @@ By default, the app uses the regional TTS endpoint format `https://<speech-regio
 
 For transcription, the app calls `POST /speechtotext/transcriptions:transcribe?api-version=2025-10-15` and sets `enhancedMode.model = "mai-transcribe-1"`.
 
+The app also includes an experimental real-time transcription attempt that uses the Azure Speech SDK and the default microphone on the local machine. This is a best-effort fixed-window capture mode for interactive testing; it is separate from the file-based MAI-Transcribe REST request.
+
 - [MAI-Transcribe-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe)
 - [MAI-Voice-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-voices)
 

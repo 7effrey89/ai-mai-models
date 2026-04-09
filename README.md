@@ -19,8 +19,9 @@ A Streamlit playground for testing the three new Microsoft Foundry MAI models:
 - Python 3.9+
 - An **Azure Speech resource** (for MAI-Transcribe-1 and MAI-Voice-1)
   - Key and region available from the Azure portal
-- A **Microsoft Foundry / Azure OpenAI resource** with **MAI-Image-2 deployed** (for MAI-Image-2)
-  - Endpoint, API key, and deployment name available from the Azure portal
+- A **Microsoft Foundry resource/project** with **MAI-Image-2 deployed** (for MAI-Image-2)
+  - Foundry endpoint and deployment name available from the Azure portal or Foundry portal
+  - For Entra ID auth, a working Azure identity via `DefaultAzureCredential` such as Azure CLI login, Visual Studio Code sign-in, or managed identity
 
 ## Setup
 
@@ -47,10 +48,13 @@ cp .env.example .env
 |---|---|
 | `AZURE_SPEECH_KEY` | Azure Speech resource key (MAI-Transcribe-1 & MAI-Voice-1) |
 | `AZURE_SPEECH_REGION` | Azure region, e.g. `eastus` |
-| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL (MAI-Image-2) |
-| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
-| `AZURE_OPENAI_DEPLOYMENT` | Your MAI-Image-2 deployment name |
-| `AZURE_OPENAI_API_VERSION` | API version, e.g. `2024-02-15-preview` |
+| `AZURE_FOUNDRY_ENDPOINT` | Foundry endpoint URL for MAI-Image-2. Can be either `https://<resource>.services.ai.azure.com` or `https://<resource>.services.ai.azure.com/api/projects/<project>` |
+| `AZURE_FOUNDRY_AUTH_METHOD` | `azuredefault` or `api-key` |
+| `AZURE_TENANT_ID` | Tenant to use for Azure Default Credential token acquisition |
+| `AZURE_FOUNDRY_API_KEY` | Foundry API key. Leave blank when using `azuredefault` |
+| `AZURE_FOUNDRY_DEPLOYMENT` | Your MAI-Image-2 deployment name |
+
+The app also accepts the legacy variable names `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`, and `AZURE_OPENAI_DEPLOYMENT` for backward compatibility, but new setups should prefer the `AZURE_FOUNDRY_*` names.
 
 You can also enter credentials directly in the **sidebar** of the running app – no `.env` file required.
 
@@ -74,6 +78,23 @@ Both models are available through the **Azure Speech Service**. Create a Speech 
 - [MAI-Voice-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-voices)
 
 ### MAI-Image-2
+
+MAI-Image-2 in Foundry uses the MAI image API rather than the legacy Azure OpenAI images route.
+
+The app supports two auth modes for MAI-Image-2:
+
+- `api-key`: sends the `api-key` header.
+- `azuredefault`: uses a tenant-aware Azure credential chain and requests a bearer token for `https://cognitiveservices.azure.com/.default`.
+
+When `AZURE_TENANT_ID` is set, the app requests the token from that tenant explicitly. This is necessary when your local Azure sign-in defaults to a different tenant than the Foundry resource.
+
+The API endpoint has the following form:
+
+```text
+https://<resource-name>.services.ai.azure.com/mai/v1/images/generations
+```
+
+If you only have a project endpoint such as `https://<resource-name>.services.ai.azure.com/api/projects/proj-default`, the app strips the `/api/projects/...` suffix automatically and calls the correct MAI image API URL.
 
 Deploy via the Azure CLI:
 

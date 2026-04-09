@@ -7,10 +7,12 @@ A Streamlit app that lets you interactively test three new Microsoft Foundry mod
 """
 
 import base64
+import importlib
 import io
 import json
 import os
 import re
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -23,9 +25,10 @@ load_dotenv()
 # Validation helpers
 # ---------------------------------------------------------------------------
 _AZURE_REGION_RE = re.compile(r"^[a-z0-9-]{1,50}$")
-_AZURE_OPENAI_ENDPOINT_RE = re.compile(
-    r"^https://[a-zA-Z0-9-]+\.openai\.azure\.com/?$"
+_FOUNDRY_HOST_RE = re.compile(
+    r"^[a-zA-Z0-9-]+\.services\.ai\.azure\.com$"
 )
+_FOUNDRY_TOKEN_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 
 def _validate_speech_region(region: str) -> str:
@@ -39,15 +42,123 @@ def _validate_speech_region(region: str) -> str:
     return region
 
 
-def _validate_openai_endpoint(endpoint: str) -> str:
-    """Return the endpoint if it looks like a valid Azure OpenAI URL, else raise."""
+def _normalize_foundry_endpoint(endpoint: str) -> str:
+    """Normalize a Foundry resource or project endpoint to its resource base URL."""
     endpoint = endpoint.strip().rstrip("/")
-    if not _AZURE_OPENAI_ENDPOINT_RE.match(endpoint):
+    parsed = urlparse(endpoint)
+
+    if parsed.scheme != "https" or not parsed.netloc:
         raise ValueError(
-            f"Invalid Azure OpenAI endpoint '{endpoint}'. "
-            "Expected format: https://<resource-name>.openai.azure.com"
+            f"Invalid Foundry endpoint '{endpoint}'. "
+            "Expected format: https://<resource-name>.services.ai.azure.com "
+            "or https://<resource-name>.services.ai.azure.com/api/projects/<project-name>."
         )
-    return endpoint
+
+    if not _FOUNDRY_HOST_RE.match(parsed.netloc):
+        raise ValueError(
+            f"Invalid Foundry endpoint '{endpoint}'. "
+            "Expected a host in the format https://<resource-name>.services.ai.azure.com."
+        )
+
+    return f"https://{parsed.netloc}"
+
+
+def _parse_image_size(size: str) -> tuple[int, int]:
+    """Convert a WIDTHxHEIGHT UI value into numeric dimensions."""
+    width_str, height_str = size.split("x", maxsplit=1)
+    return int(width_str), int(height_str)
+
+
+def _normalize_foundry_auth_method(auth_method: str) -> str:
+    """Normalize a Foundry auth mode string to a supported value."""
+    normalized = auth_method.strip().lower()
+    if normalized in {"api-key", "apikey", "key"}:
+        return "api-key"
+    if normalized in {"azuredefault", "default", "defaultazurecredential"}:
+        return "azuredefault"
+    raise ValueError(
+        f"Invalid Foundry auth method '{auth_method}'. "
+        "Expected 'api-key' or 'azuredefault'."
+    )
+
+
+def _normalize_tenant_id(tenant_id: str) -> str:
+    """Normalize an optional tenant identifier."""
+    return tenant_id.strip()
+
+
+@st.cache_resource
+def _get_default_credential(tenant_id: str):
+    """Create a cached Azure credential chain on demand."""
+    try:
+        azure_identity = importlib.import_module("azure.identity")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Azure default authentication requires the 'azure-identity' package. "
+            "Install it from requirements.txt and try again."
+        ) from exc
+
+    normalized_tenant_id = _normalize_tenant_id(tenant_id)
+    if not normalized_tenant_id:
+        return azure_identity.DefaultAzureCredential()
+
+    credentials = []
+
+    has_env_sp = bool(os.getenv("AZURE_CLIENT_ID")) and (
+        bool(os.getenv("AZURE_CLIENT_SECRET"))
+        or bool(os.getenv("AZURE_CLIENT_CERTIFICATE_PATH"))
+    )
+    if has_env_sp:
+        credentials.append(azure_identity.EnvironmentCredential())
+
+    has_workload_identity = bool(os.getenv("AZURE_CLIENT_ID")) and bool(
+        os.getenv("AZURE_FEDERATED_TOKEN_FILE")
+    )
+    if has_workload_identity:
+        credentials.append(
+            azure_identity.WorkloadIdentityCredential(tenant_id=normalized_tenant_id)
+        )
+
+    credentials.extend(
+        [
+            azure_identity.ManagedIdentityCredential(),
+            azure_identity.SharedTokenCacheCredential(
+                username=os.getenv("AZURE_USERNAME") or None,
+                tenant_id=normalized_tenant_id,
+            ),
+            azure_identity.VisualStudioCodeCredential(tenant_id=normalized_tenant_id),
+            azure_identity.AzureCliCredential(tenant_id=normalized_tenant_id),
+            azure_identity.AzurePowerShellCredential(tenant_id=normalized_tenant_id),
+            azure_identity.AzureDeveloperCliCredential(tenant_id=normalized_tenant_id),
+        ]
+    )
+
+    return azure_identity.ChainedTokenCredential(*credentials)
+
+
+def _build_foundry_headers(auth_method: str, api_key: str, tenant_id: str) -> dict[str, str]:
+    """Build the MAI-Image-2 request headers for the chosen auth method."""
+    headers = {"Content-Type": "application/json"}
+
+    if auth_method == "api-key":
+        key = api_key.strip()
+        if not key:
+            raise ValueError(
+                "Please provide your Azure AI Foundry API Key in the sidebar."
+            )
+        headers["api-key"] = key
+        return headers
+
+    try:
+        token = _get_default_credential(tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to acquire a token with DefaultAzureCredential. "
+            f"{exc}"
+        ) from exc
+
+    headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -87,24 +198,58 @@ with st.sidebar:
         help='E.g. "eastus", "westeurope".',
     )
     openai_endpoint = st.text_input(
-        "Azure OpenAI Endpoint",
-        value=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
-        help='E.g. "https://my-resource.openai.azure.com"',
+        "Azure AI Foundry Endpoint",
+        value=os.getenv("AZURE_FOUNDRY_ENDPOINT", os.getenv("AZURE_OPENAI_ENDPOINT", "")),
+        help=(
+            'E.g. "https://my-resource.services.ai.azure.com" or '
+            '"https://my-resource.services.ai.azure.com/api/projects/my-project"'
+        ),
+    )
+    default_auth_method = os.getenv(
+        "AZURE_FOUNDRY_AUTH_METHOD",
+        "api-key"
+        if os.getenv("AZURE_FOUNDRY_API_KEY", os.getenv("AZURE_OPENAI_KEY", "")).strip()
+        else "azuredefault",
+    )
+    try:
+        normalized_auth_method = _normalize_foundry_auth_method(default_auth_method)
+    except ValueError:
+        normalized_auth_method = "azuredefault"
+
+    foundry_auth_options = {
+        "Azure Default Credential": "azuredefault",
+        "API Key": "api-key",
+    }
+    foundry_auth_label = st.selectbox(
+        "MAI-Image-2 Auth Method",
+        options=list(foundry_auth_options.keys()),
+        index=0 if normalized_auth_method == "azuredefault" else 1,
+        help=(
+            "Use Azure Default Credential for Entra ID auth, or API Key if your "
+            "resource is configured for key-based access."
+        ),
+    )
+    foundry_auth_method = foundry_auth_options[foundry_auth_label]
+    foundry_tenant_id = st.text_input(
+        "Azure Tenant ID",
+        value=os.getenv("AZURE_TENANT_ID", ""),
+        help=(
+            "Optional tenant override for Azure Default Credential. Use this when "
+            "your Foundry resource belongs to a different tenant than your default sign-in."
+        ),
+        disabled=foundry_auth_method != "azuredefault",
     )
     openai_key = st.text_input(
-        "Azure OpenAI API Key",
-        value=os.getenv("AZURE_OPENAI_KEY", ""),
+        "Azure AI Foundry API Key",
+        value=os.getenv("AZURE_FOUNDRY_API_KEY", os.getenv("AZURE_OPENAI_KEY", "")),
         type="password",
-        help="Used by MAI-Image-2.",
+        disabled=foundry_auth_method != "api-key",
+        help="Used only when MAI-Image-2 Auth Method is set to API Key.",
     )
     openai_deployment = st.text_input(
         "MAI-Image-2 Deployment Name",
-        value=os.getenv("AZURE_OPENAI_DEPLOYMENT", "mai-image-2"),
+        value=os.getenv("AZURE_FOUNDRY_DEPLOYMENT", os.getenv("AZURE_OPENAI_DEPLOYMENT", "mai-image-2")),
         help="The deployment name you chose when deploying MAI-Image-2 in Foundry.",
-    )
-    openai_api_version = st.text_input(
-        "Azure OpenAI API Version",
-        value=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
     )
 
     st.divider()
@@ -113,6 +258,7 @@ with st.sidebar:
         "- [MAI-Transcribe-1 docs](https://learn.microsoft.com/azure/ai-services/speech-service/mai-transcribe)\n"
         "- [MAI-Voice-1 docs](https://learn.microsoft.com/azure/ai-services/speech-service/mai-voices)\n"
         "- [MAI-Image-2 docs](https://learn.microsoft.com/azure/foundry/foundry-models/how-to/use-foundry-models-mai)\n"
+        "- [DefaultAzureCredential docs](https://learn.microsoft.com/python/api/azure-identity/azure.identity.defaultazurecredential)\n"
     )
 
 # ---------------------------------------------------------------------------
@@ -374,7 +520,17 @@ with tab_voice:
 with tab_image:
     st.header("MAI-Image-2 — Text to Image")
     st.markdown(
-        "Describe an image and MAI-Image-2 will generate it for you."
+        "Describe an image and MAI-Image-2 will generate it for you through the "
+        "Foundry MAI image API."
+    )
+    st.info(
+        "**How it works:** MAI-Image-2 uses the Foundry MAI image API at "
+        "`/mai/v1/images/generations`. If you paste a project endpoint such as "
+        "`https://<resource>.services.ai.azure.com/api/projects/<project>`, the app "
+        "automatically normalizes it to the resource base URL required by the API. "
+        "Authentication can be either API key or Azure Default Credential. When a "
+        "tenant ID is provided, the app requests the token from that tenant explicitly.",
+        icon="ℹ️",
     )
 
     image_prompt = st.text_area(
@@ -395,40 +551,48 @@ with tab_image:
         num_images = st.slider("Number of images", min_value=1, max_value=4, value=1)
 
     if st.button("Generate Image", type="primary"):
-        if not openai_endpoint or not openai_key or not openai_deployment:
+        if not openai_endpoint or not openai_deployment:
             st.error(
-                "Please provide your Azure OpenAI Endpoint, API Key, and Deployment "
-                "Name in the sidebar."
+                "Please provide your Azure AI Foundry Endpoint and Deployment Name "
+                "in the sidebar."
             )
+        elif foundry_auth_method == "azuredefault" and not _normalize_tenant_id(foundry_tenant_id):
+            st.error("Please provide the Azure Tenant ID for Azure Default Credential.")
+        elif foundry_auth_method == "api-key" and not openai_key.strip():
+            st.error("Please provide your Azure AI Foundry API Key in the sidebar.")
         elif not image_prompt.strip():
             st.warning("Please enter an image prompt.")
         else:
             with st.spinner("Generating image with MAI-Image-2…"):
                 try:
-                    validated_endpoint = _validate_openai_endpoint(openai_endpoint)
+                    validated_endpoint = _normalize_foundry_endpoint(openai_endpoint)
+                    headers = _build_foundry_headers(
+                        foundry_auth_method,
+                        openai_key,
+                        foundry_tenant_id,
+                    )
                 except ValueError as exc:
                     st.error(str(exc))
                     st.stop()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+                    st.stop()
 
-                url = (
-                    f"{validated_endpoint}"
-                    f"/openai/deployments/{openai_deployment}"
-                    f"/images/generations?api-version={openai_api_version}"
-                )
+                width, height = _parse_image_size(image_size)
+                url = f"{validated_endpoint}/mai/v1/images/generations"
 
                 payload = {
+                    "model": openai_deployment,
                     "prompt": image_prompt,
                     "n": num_images,
-                    "size": image_size,
+                    "width": width,
+                    "height": height,
                 }
 
                 try:
                     img_response = requests.post(
                         url,
-                        headers={
-                            "api-key": openai_key,
-                            "Content-Type": "application/json",
-                        },
+                        headers=headers,
                         json=payload,
                         timeout=120,
                     )

@@ -85,7 +85,25 @@ By default, the app uses the regional TTS endpoint format `https://<speech-regio
 
 For transcription, the app calls `POST /speechtotext/transcriptions:transcribe?api-version=2025-10-15` and sets `enhancedMode.model = "mai-transcribe-1"`.
 
-The app also includes an experimental real-time transcription attempt that uses the Azure Speech SDK and the default microphone on the local machine. This is a best-effort fixed-window capture mode for interactive testing; it is separate from the file-based MAI-Transcribe REST request.
+The app also includes an experimental real-time transcription mode that continuously records from the default microphone and sends overlapping audio micro-batches to the MAI-Transcribe-1 REST API in parallel. This simulates streaming transcription without requiring a WebSocket-based API.
+
+#### Voice Activity Detection (VAD)
+
+The real-time transcription pipeline integrates **voice activity detection** via [`webrtcvad`](https://github.com/wiseman/py-webrtcvad), a lightweight C extension that needs no GPU or torch dependency. When the "Skip silent chunks (VAD)" checkbox is enabled (the default):
+
+- Each audio chunk is scanned in 20 ms frames at 16 kHz.
+- If fewer than 10 % of frames contain speech, the chunk is **skipped entirely** — no API call is made.
+- The status bar shows how many chunks were silently dropped (e.g. `3 silent`).
+
+This significantly reduces the number of API calls during pauses in speech, lowering both latency and cost. If `webrtcvad` is not installed the app degrades gracefully and sends every chunk.
+
+#### Custom prompting and translation
+
+MAI-Transcribe-1 enhanced mode supports LLM-style custom prompting. In the UI you can:
+
+- **Task** — choose *transcribe* (output in source language) or *translate* (output in a target language).
+- **Target language** — BCP-47 locale for translation output (only active when Task = translate).
+- **Custom prompt** — free-text instructions for the model, e.g. domain terms, formatting style, or output language hints.
 
 - [MAI-Transcribe-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe)
 - [MAI-Voice-1 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-voices)

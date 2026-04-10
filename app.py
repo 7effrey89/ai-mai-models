@@ -328,11 +328,14 @@ def _run_realtime_mai_transcription(
     chunk_seconds: float = 1.0,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Continuously record audio and transcribe micro-batches via the MAI-Transcribe-1
-    REST API until *stop_event* is set. Recording and API calls run concurrently so
-    there are no gaps in audio capture."""
+    """Continuously record audio via a persistent InputStream and transcribe
+    micro-batches via the MAI-Transcribe-1 REST API. The microphone stays open
+    for the entire session — no gaps between chunks."""
+    import queue
     from collections import OrderedDict
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    import numpy as np
 
     try:
         import sounddevice as sd
@@ -386,27 +389,51 @@ def _run_realtime_mai_transcription(
     if "rt_results" not in st.session_state:
         st.session_state.rt_results = []
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # --- Continuous audio capture via InputStream callback ---
+    # The callback pushes raw audio frames into a thread-safe queue.
+    # The main loop drains the queue to assemble fixed-size chunks with zero
+    # gaps, exactly like whisper_streaming's arecord | nc pipe approach.
+    audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+
+    def _audio_callback(indata, frames, time_info, status):
+        # Copy because indata buffer is reused by sounddevice
+        audio_queue.put(indata[:, 0].copy())
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+        blocksize=1024,
+        callback=_audio_callback,
+    ), ThreadPoolExecutor(max_workers=4) as pool:
+
+        audio_buffer = np.empty(0, dtype=np.int16)
+
         while not stop_event.is_set():
             status_placeholder.info(
-                f"\U0001f399\ufe0f Listening \u2014 recording {chunk_seconds}s chunks\u2026 "
+                f"\U0001f399\ufe0f Listening \u2014 {chunk_seconds}s chunks\u2026 "
                 f"({batch_idx} chunks sent)"
             )
 
-            audio_data = sd.rec(
-                chunk_frames,
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-            )
-            sd.wait()
+            # Accumulate audio from the queue until we have a full chunk
+            while len(audio_buffer) < chunk_frames and not stop_event.is_set():
+                try:
+                    block = audio_queue.get(timeout=0.1)
+                    audio_buffer = np.concatenate([audio_buffer, block])
+                except queue.Empty:
+                    continue
 
-            # Check again after recording in case Stop was pressed during capture
             if stop_event.is_set():
                 break
 
+            # Slice exactly chunk_frames; keep any overflow for the next chunk
+            chunk_data = audio_buffer[:chunk_frames]
+            audio_buffer = audio_buffer[chunk_frames:]
+
             batch_idx += 1
-            wav_bytes = _audio_to_wav_bytes(audio_data, SAMPLE_RATE, CHANNELS)
+            wav_bytes = _audio_to_wav_bytes(
+                chunk_data.reshape(-1, 1), SAMPLE_RATE, CHANNELS
+            )
 
             results[batch_idx] = ""
 
@@ -415,13 +442,14 @@ def _run_realtime_mai_transcription(
             )
             pending_futures[future] = batch_idx
 
-            # Collect any completed results
+            # Collect any completed results and persist incrementally
             done = [f for f in pending_futures if f.done()]
             for f in done:
                 idx, text = f.result()
                 results[idx] = text
                 del pending_futures[f]
 
+            st.session_state.rt_results = [t for t in results.values() if t]
             _render_transcript()
 
         # Drain remaining in-flight API calls
@@ -806,10 +834,11 @@ with tab_transcribe:
 
     if toggle_clicked:
         if st.session_state.rt_recording:
-            # Stop
+            # Stop — signal the recording loop and reset state.
+            # The Streamlit rerun will kill the previous blocking run,
+            # but results were saved incrementally to rt_results.
             st.session_state.rt_stop_event.set()
             st.session_state.rt_recording = False
-            st.rerun()
         else:
             # Start — set flag and rerun so the button re-renders as "Stop"
             st.session_state.rt_stop_event.clear()

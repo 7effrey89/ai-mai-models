@@ -4,3 +4,4 @@ python-dotenv>=1.0.0
 Pillow>=10.0.0
 azure-identity>=1.19.0
 azure-cognitiveservices-speech>=1.41.1
+sounddevice>=0.4.6

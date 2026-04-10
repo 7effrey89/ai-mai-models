@@ -257,6 +257,33 @@ def _audio_to_wav_bytes(audio_data, sample_rate: int, channels: int) -> bytes:
     return wav_buffer.getvalue()
 
 
+def _is_speech(audio_int16, sample_rate: int = 16000, aggressiveness: int = 2) -> bool:
+    """Return True if *audio_int16* contains speech, using webrtcvad.
+
+    Falls back to True (always send) if webrtcvad is not installed.
+    *aggressiveness* ranges from 0 (least aggressive / most sensitive) to 3.
+    """
+    try:
+        import webrtcvad  # lightweight C extension, no torch needed
+    except ImportError:
+        return True  # degrade gracefully — send everything
+
+    vad = webrtcvad.Vad(aggressiveness)
+    raw = audio_int16.tobytes()
+    # webrtcvad requires frames of 10, 20, or 30 ms at 16 kHz (320, 640, 960 bytes).
+    frame_bytes = 640  # 20 ms at 16 kHz, 16-bit mono
+    speech_frames = 0
+    total_frames = 0
+    for offset in range(0, len(raw) - frame_bytes + 1, frame_bytes):
+        total_frames += 1
+        if vad.is_speech(raw[offset : offset + frame_bytes], sample_rate):
+            speech_frames += 1
+    if total_frames == 0:
+        return False
+    # Consider the chunk speech if >=10% of frames contain voice
+    return (speech_frames / total_frames) >= 0.10
+
+
 def _transcribe_chunk(
     wav_bytes: bytes,
     batch_idx: int,
@@ -264,19 +291,28 @@ def _transcribe_chunk(
     headers: dict[str, str],
     locale: str,
     tenant_id: str = "",
+    task: str = "transcribe",
+    prompt: str = "",
+    target_locales: list[str] | None = None,
 ) -> tuple[int, str]:
     """Send a single WAV chunk to the MAI-Transcribe-1 REST API. Returns (batch_idx, text)."""
     # Use a thread-local copy of headers so concurrent retries don't race.
     local_headers = dict(headers)
 
+    enhanced_mode: dict = {
+        "enabled": True,
+        "task": task,
+        "model": "mai-transcribe-1",
+    }
+    if prompt:
+        enhanced_mode["prompt"] = prompt
+    if target_locales:
+        enhanced_mode["targetLocales"] = target_locales
+
     definition = json.dumps(
         {
             "locales": [locale],
-            "enhancedMode": {
-                "enabled": True,
-                "task": "transcribe",
-                "model": "mai-transcribe-1",
-            },
+            "enhancedMode": enhanced_mode,
         }
     )
     files = {
@@ -328,13 +364,20 @@ def _run_realtime_mai_transcription(
     chunk_seconds: float = 3.0,
     overlap_seconds: float = 1.0,
     stop_event: threading.Event | None = None,
+    task: str = "transcribe",
+    prompt: str = "",
+    target_locales: list[str] | None = None,
+    enable_vad: bool = True,
 ) -> None:
     """Continuously record audio via a persistent InputStream and transcribe
     micro-batches via the MAI-Transcribe-1 REST API. The microphone stays open
     for the entire session — no gaps between chunks.
 
     Each chunk overlaps the previous one by *overlap_seconds* so words at
-    chunk boundaries are not lost (the model sees them in full context)."""
+    chunk boundaries are not lost (the model sees them in full context).
+
+    When *enable_vad* is True, chunks that contain no detectable speech are
+    skipped entirely (requires the ``webrtcvad`` package)."""
     import queue
     from collections import OrderedDict
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -381,6 +424,7 @@ def _run_realtime_mai_transcription(
     pending_futures = {}
     submit_times: dict[int, float] = {}
     batch_idx = 0
+    skipped_silent = 0
     responses_received = 0
     last_latency_ms = 0.0
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
@@ -420,10 +464,11 @@ def _run_realtime_mai_transcription(
         audio_buffer = np.empty(0, dtype=np.int16)
 
         while not stop_event.is_set():
+            vad_label = f" \u2022 {skipped_silent} silent" if enable_vad else ""
             status_placeholder.info(
                 f"\U0001f399\ufe0f Listening \u2014 {chunk_seconds}s chunks "
                 f"({overlap_seconds}s overlap)\u2026 "
-                f"({batch_idx} sent \u2022 {responses_received} received"
+                f"({batch_idx} sent \u2022 {responses_received} received{vad_label}"
                 f"{f' \u2022 {last_latency_ms:.0f}ms latency' if last_latency_ms else ''})"
             )
 
@@ -450,6 +495,11 @@ def _run_realtime_mai_transcription(
                 chunk_data = audio_buffer
                 audio_buffer = np.empty(0, dtype=np.int16)
 
+            # --- VAD gate: skip chunks with no detectable speech ---
+            if enable_vad and not _is_speech(chunk_data, SAMPLE_RATE):
+                skipped_silent += 1
+                continue
+
             batch_idx += 1
             wav_bytes = _audio_to_wav_bytes(
                 chunk_data.reshape(-1, 1), SAMPLE_RATE, CHANNELS
@@ -459,7 +509,8 @@ def _run_realtime_mai_transcription(
             submit_times[batch_idx] = time.monotonic()
 
             future = pool.submit(
-                _transcribe_chunk, wav_bytes, batch_idx, endpoint, headers, locale, _tenant_id
+                _transcribe_chunk, wav_bytes, batch_idx, endpoint, headers, locale, _tenant_id,
+                task, prompt, target_locales,
             )
             pending_futures[future] = batch_idx
 
@@ -683,7 +734,15 @@ tab_transcribe, tab_voice, tab_image = st.tabs(
 # ===========================================================================
 # Helper – call MAI-Transcribe-1 API and render result
 # ===========================================================================
-def _run_transcription(audio_bytes: bytes, filename: str, mime: str, locale: str) -> None:
+def _run_transcription(
+    audio_bytes: bytes,
+    filename: str,
+    mime: str,
+    locale: str,
+    task: str = "transcribe",
+    prompt: str = "",
+    target_locales: list[str] | None = None,
+) -> None:
     """Send *audio_bytes* to MAI-Transcribe-1 and render the transcript."""
     with st.spinner("Transcribing with MAI-Transcribe-1…"):
         try:
@@ -701,14 +760,20 @@ def _run_transcription(audio_bytes: bytes, filename: str, mime: str, locale: str
                     "?api-version=2025-10-15"
                 )
 
+            enhanced_mode: dict = {
+                        "enabled": True,
+                        "task": task,
+                        "model": "mai-transcribe-1",
+                    }
+            if prompt:
+                enhanced_mode["prompt"] = prompt
+            if target_locales:
+                enhanced_mode["targetLocales"] = target_locales
+
             definition = json.dumps(
                 {
                     "locales": [locale],
-                    "enhancedMode": {
-                        "enabled": True,
-                        "task": "transcribe",
-                        "model": "mai-transcribe-1",
-                    },
+                    "enhancedMode": enhanced_mode,
                 }
             )
             files = {
@@ -791,6 +856,35 @@ with tab_transcribe:
         index=0,
     )
 
+    settings_col1, settings_col2 = st.columns(2)
+    with settings_col1:
+        transcribe_task = st.selectbox(
+            "Task",
+            options=["transcribe", "translate"],
+            index=0,
+            help="**transcribe** outputs text in the source language; **translate** outputs English (or your target language).",
+        )
+        transcribe_target_locale = st.text_input(
+            "Target language (for translate)",
+            value="en-US",
+            help="BCP-47 locale for translation output. Only used when Task = translate.",
+            disabled=transcribe_task != "translate",
+        )
+    with settings_col2:
+        transcribe_prompt = st.text_area(
+            "Custom prompt",
+            value="",
+            height=100,
+            help=(
+                "Custom instructions for the LLM speech model. Use this to specify output "
+                "language, domain terms, formatting style, or contextual hints. "
+                "Example: *Transcribe in formal English. Technical terms: Azure, Kubernetes, CI/CD.*"
+            ),
+            placeholder="e.g. Transcribe in formal English. The speaker discusses cloud computing.",
+        )
+
+    _target_locales = [transcribe_target_locale.strip()] if transcribe_task == "translate" and transcribe_target_locale.strip() else None
+
     input_col1, input_col2 = st.columns(2)
 
     # ------------------------------------------------------------------
@@ -809,6 +903,9 @@ with tab_transcribe:
                 filename="recording.wav",
                 mime="audio/wav",
                 locale=transcribe_language,
+                task=transcribe_task,
+                prompt=transcribe_prompt,
+                target_locales=_target_locales,
             )
 
     # ------------------------------------------------------------------
@@ -827,6 +924,9 @@ with tab_transcribe:
                 filename=audio_file.name,
                 mime=audio_file.type or "audio/wav",
                 locale=transcribe_language,
+                task=transcribe_task,
+                prompt=transcribe_prompt,
+                target_locales=_target_locales,
             )
 
     st.divider()
@@ -868,6 +968,15 @@ with tab_transcribe:
             help="Shared audio between consecutive chunks to prevent word loss at boundaries.",
         )
 
+    realtime_enable_vad = st.checkbox(
+        "Skip silent chunks (VAD)",
+        value=True,
+        help=(
+            "Uses voice activity detection to skip silent audio chunks, reducing API calls "
+            "and cost. Requires the `webrtcvad` package; falls back to sending all chunks if not installed."
+        ),
+    )
+
     # Callback runs BEFORE the rerun — state changes are atomic and can't race.
     def _on_toggle_click():
         if st.session_state.rt_recording:
@@ -893,6 +1002,10 @@ with tab_transcribe:
                 chunk_seconds=realtime_chunk_seconds,
                 overlap_seconds=realtime_overlap_seconds,
                 stop_event=st.session_state.rt_stop_event,
+                task=transcribe_task,
+                prompt=transcribe_prompt,
+                target_locales=_target_locales,
+                enable_vad=realtime_enable_vad,
             )
         except ValueError as exc:
             st.error(str(exc))

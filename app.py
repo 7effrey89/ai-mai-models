@@ -244,10 +244,95 @@ def _build_transcription_headers(subscription_key: str, tenant_id: str) -> dict[
     return {"Authorization": f"Bearer {token}"}
 
 
-def _run_realtime_mai_transcription(locale: str, duration_seconds: int) -> None:
-    """Simulate real-time transcription by recording micro-batches from the default
-    microphone and sending each batch to the MAI-Transcribe-1 REST API."""
+def _audio_to_wav_bytes(audio_data, sample_rate: int, channels: int) -> bytes:
+    """Convert raw int16 audio samples to WAV bytes in memory."""
     import wave
+
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_data.tobytes())
+    return wav_buffer.getvalue()
+
+
+def _transcribe_chunk(
+    wav_bytes: bytes,
+    batch_idx: int,
+    endpoint: str,
+    headers: dict[str, str],
+    locale: str,
+    tenant_id: str = "",
+) -> tuple[int, str]:
+    """Send a single WAV chunk to the MAI-Transcribe-1 REST API. Returns (batch_idx, text)."""
+    # Use a thread-local copy of headers so concurrent retries don't race.
+    local_headers = dict(headers)
+
+    definition = json.dumps(
+        {
+            "locales": [locale],
+            "enhancedMode": {
+                "enabled": True,
+                "task": "transcribe",
+                "model": "mai-transcribe-1",
+            },
+        }
+    )
+    files = {
+        "audio": (f"batch_{batch_idx}.wav", wav_bytes, "audio/wav"),
+        "definition": (None, definition, "application/json"),
+    }
+
+    try:
+        response = requests.post(endpoint, headers=local_headers, files=files, timeout=30)
+
+        # Retry with Entra if key auth is disabled on the Speech resource
+        if (
+            response.status_code == 403
+            and "AuthenticationTypeDisabled" in response.text
+            and local_headers.get("Ocp-Apim-Subscription-Key")
+        ):
+            local_headers = _build_transcription_headers("", tenant_id)
+            # Propagate the fix back so future batches use Entra from the start
+            headers.clear()
+            headers.update(local_headers)
+            files = {
+                "audio": (f"batch_{batch_idx}.wav", wav_bytes, "audio/wav"),
+                "definition": (None, definition, "application/json"),
+            }
+            response = requests.post(endpoint, headers=local_headers, files=files, timeout=30)
+
+        response.raise_for_status()
+        result = response.json()
+
+        text = result.get("text", "")
+        if not text:
+            combined = result.get("combinedPhrases", [])
+            if combined:
+                text = " ".join(p.get("text", "") for p in combined)
+            else:
+                phrases = result.get("phrases", [])
+                text = " ".join(p.get("text", "") for p in phrases)
+
+        return batch_idx, text.strip()
+
+    except requests.HTTPError as exc:
+        return batch_idx, f"[Batch {batch_idx} API error {exc.response.status_code}]"
+    except Exception as exc:
+        return batch_idx, f"[Batch {batch_idx} error: {exc}]"
+
+
+def _run_realtime_mai_transcription(
+    locale: str,
+    chunk_seconds: float = 1.0,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Continuously record audio and transcribe micro-batches via the MAI-Transcribe-1
+    REST API until *stop_event* is set. Recording and API calls run concurrently so
+    there are no gaps in audio capture."""
+    from collections import OrderedDict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     try:
         import sounddevice as sd
@@ -257,11 +342,13 @@ def _run_realtime_mai_transcription(locale: str, duration_seconds: int) -> None:
             "Install it from requirements.txt and restart the app."
         ) from exc
 
+    if stop_event is None:
+        stop_event = threading.Event()
+
     SAMPLE_RATE = 16000
     CHANNELS = 1
-    BATCH_SECONDS = 3
 
-    # Build the MAI-Transcribe-1 endpoint (same logic as _run_transcription)
+    # Build the MAI-Transcribe-1 endpoint
     normalized_speech_endpoint = _normalize_speech_service_endpoint(speech_endpoint)
     if normalized_speech_endpoint:
         endpoint = (
@@ -276,106 +363,82 @@ def _run_realtime_mai_transcription(locale: str, duration_seconds: int) -> None:
             "?api-version=2025-10-15"
         )
 
-    headers = _build_transcription_headers(speech_key, foundry_tenant_id)
+    # Capture Streamlit widget values in the main thread before spawning workers.
+    _tenant_id = foundry_tenant_id
+    headers = _build_transcription_headers(speech_key, _tenant_id)
 
     status_placeholder = st.empty()
     transcript_placeholder = st.empty()
-    recognized_segments: list[str] = []
 
-    recorded = 0
+    results: OrderedDict[int, str] = OrderedDict()
+    pending_futures = {}
     batch_idx = 0
+    chunk_frames = int(chunk_seconds * SAMPLE_RATE)
 
-    while recorded < duration_seconds:
-        batch_duration = min(BATCH_SECONDS, duration_seconds - recorded)
-        batch_idx += 1
-        seconds_left = duration_seconds - recorded
+    def _render_transcript() -> None:
+        lines = [text for text in results.values() if text]
+        if lines:
+            transcript_placeholder.code("\n".join(lines), language="text")
+        else:
+            transcript_placeholder.info("Listening\u2026", icon="\U0001f4dd")
 
-        status_placeholder.info(
-            f"\U0001f399\ufe0f Recording batch {batch_idx} "
-            f"({batch_duration}s) \u2014 {seconds_left}s of audio remaining\u2026"
-        )
+    # Persist results in session_state so they survive the rerun triggered by Stop
+    if "rt_results" not in st.session_state:
+        st.session_state.rt_results = []
 
-        audio_data = sd.rec(
-            int(batch_duration * SAMPLE_RATE),
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-        )
-        sd.wait()
-        recorded += batch_duration
-
-        # Convert to WAV bytes in memory
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio_data.tobytes())
-        wav_bytes = wav_buffer.getvalue()
-
-        status_placeholder.info(f"Transcribing batch {batch_idx}\u2026")
-
-        definition = json.dumps(
-            {
-                "locales": [locale],
-                "enhancedMode": {
-                    "enabled": True,
-                    "task": "transcribe",
-                    "model": "mai-transcribe-1",
-                },
-            }
-        )
-        files = {
-            "audio": (f"batch_{batch_idx}.wav", wav_bytes, "audio/wav"),
-            "definition": (None, definition, "application/json"),
-        }
-
-        try:
-            response = requests.post(endpoint, headers=headers, files=files, timeout=30)
-
-            # Retry with Entra if key auth is disabled on the Speech resource
-            if (
-                response.status_code == 403
-                and "AuthenticationTypeDisabled" in response.text
-                and headers.get("Ocp-Apim-Subscription-Key")
-            ):
-                headers = _build_transcription_headers("", foundry_tenant_id)
-                response = requests.post(
-                    endpoint, headers=headers, files=files, timeout=30
-                )
-
-            response.raise_for_status()
-            result = response.json()
-
-            text = result.get("text", "")
-            if not text:
-                combined = result.get("combinedPhrases", [])
-                if combined:
-                    text = " ".join(p.get("text", "") for p in combined)
-                else:
-                    phrases = result.get("phrases", [])
-                    text = " ".join(p.get("text", "") for p in phrases)
-
-            if text.strip():
-                recognized_segments.append(text.strip())
-
-        except requests.HTTPError as exc:
-            recognized_segments.append(
-                f"[Batch {batch_idx} API error {exc.response.status_code}]"
-            )
-        except Exception as exc:
-            recognized_segments.append(f"[Batch {batch_idx} error: {exc}]")
-
-        # Update the live transcript display
-        if recognized_segments:
-            transcript_placeholder.code(
-                "\n".join(recognized_segments), language="text"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        while not stop_event.is_set():
+            status_placeholder.info(
+                f"\U0001f399\ufe0f Listening \u2014 recording {chunk_seconds}s chunks\u2026 "
+                f"({batch_idx} chunks sent)"
             )
 
-    if recognized_segments:
+            audio_data = sd.rec(
+                chunk_frames,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+            )
+            sd.wait()
+
+            # Check again after recording in case Stop was pressed during capture
+            if stop_event.is_set():
+                break
+
+            batch_idx += 1
+            wav_bytes = _audio_to_wav_bytes(audio_data, SAMPLE_RATE, CHANNELS)
+
+            results[batch_idx] = ""
+
+            future = pool.submit(
+                _transcribe_chunk, wav_bytes, batch_idx, endpoint, headers, locale, _tenant_id
+            )
+            pending_futures[future] = batch_idx
+
+            # Collect any completed results
+            done = [f for f in pending_futures if f.done()]
+            for f in done:
+                idx, text = f.result()
+                results[idx] = text
+                del pending_futures[f]
+
+            _render_transcript()
+
+        # Drain remaining in-flight API calls
+        if pending_futures:
+            status_placeholder.info("Finishing transcription\u2026")
+            for future in as_completed(pending_futures):
+                idx, text = future.result()
+                results[idx] = text
+                _render_transcript()
+
+    final_lines = [text for text in results.values() if text]
+    st.session_state.rt_results = final_lines
+    if final_lines:
         status_placeholder.success(
-            "Real-time MAI-Transcribe-1 micro-batch transcription complete."
+            "Transcription stopped."
         )
+        _render_transcript()
     else:
         status_placeholder.warning(
             "No speech was recognized during the listening window."
@@ -715,27 +778,65 @@ with tab_transcribe:
     st.divider()
     st.subheader("⚡ Real-Time Micro-Batch Transcription")
     st.caption(
-        "Records audio from the default microphone in short chunks and sends each chunk "
-        "to the MAI-Transcribe-1 REST API, displaying results progressively."
+        "Continuously records from the default microphone and sends ~1 s audio chunks "
+        "to the MAI-Transcribe-1 REST API in parallel, displaying results as they arrive. "
+        "Toggle the button to start or stop."
     )
-    realtime_duration_seconds = st.slider(
-        "Total recording time (seconds)",
-        min_value=3,
-        max_value=30,
-        value=9,
-        step=3,
-        key="realtime_duration_seconds",
+
+    if "rt_stop_event" not in st.session_state:
+        st.session_state.rt_stop_event = threading.Event()
+    if "rt_recording" not in st.session_state:
+        st.session_state.rt_recording = False
+    if "rt_results" not in st.session_state:
+        st.session_state.rt_results = []
+    if "rt_should_start" not in st.session_state:
+        st.session_state.rt_should_start = False
+
+    realtime_chunk_seconds = st.slider(
+        "Chunk size (seconds)",
+        min_value=0.5,
+        max_value=3.0,
+        value=1.0,
+        step=0.5,
+        key="realtime_chunk_seconds",
     )
-    if st.button("Start micro-batch transcription", type="secondary"):
+
+    toggle_label = "Stop transcription" if st.session_state.rt_recording else "Start transcription"
+    toggle_clicked = st.button(toggle_label, type="primary")
+
+    if toggle_clicked:
+        if st.session_state.rt_recording:
+            # Stop
+            st.session_state.rt_stop_event.set()
+            st.session_state.rt_recording = False
+            st.rerun()
+        else:
+            # Start — set flag and rerun so the button re-renders as "Stop"
+            st.session_state.rt_stop_event.clear()
+            st.session_state.rt_recording = True
+            st.session_state.rt_results = []
+            st.session_state.rt_should_start = True
+            st.rerun()
+
+    # After rerun, the button now shows "Stop transcription" — start the blocking work
+    if st.session_state.rt_should_start:
+        st.session_state.rt_should_start = False
         try:
             _run_realtime_mai_transcription(
                 locale=transcribe_language,
-                duration_seconds=realtime_duration_seconds,
+                chunk_seconds=realtime_chunk_seconds,
+                stop_event=st.session_state.rt_stop_event,
             )
         except ValueError as exc:
             st.error(str(exc))
         except RuntimeError as exc:
             st.error(str(exc))
+        finally:
+            st.session_state.rt_recording = False
+
+    # Display previous results if available (persists after stopping)
+    if not st.session_state.rt_recording and st.session_state.rt_results:
+        st.code("\n".join(st.session_state.rt_results), language="text")
 
 # ===========================================================================
 # TAB 2 – MAI-Voice-1  (text → speech)

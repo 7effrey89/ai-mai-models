@@ -379,7 +379,10 @@ def _run_realtime_mai_transcription(
 
     results: OrderedDict[int, str] = OrderedDict()
     pending_futures = {}
+    submit_times: dict[int, float] = {}
     batch_idx = 0
+    responses_received = 0
+    last_latency_ms = 0.0
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
     overlap_frames = int(min(overlap_seconds, chunk_seconds * 0.5) * SAMPLE_RATE)
     # stride_frames is the NEW audio per chunk; the rest is overlap from the previous chunk
@@ -420,7 +423,8 @@ def _run_realtime_mai_transcription(
             status_placeholder.info(
                 f"\U0001f399\ufe0f Listening \u2014 {chunk_seconds}s chunks "
                 f"({overlap_seconds}s overlap)\u2026 "
-                f"({batch_idx} chunks sent)"
+                f"({batch_idx} sent \u2022 {responses_received} received"
+                f"{f' \u2022 {last_latency_ms:.0f}ms latency' if last_latency_ms else ''})"
             )
 
             # First chunk needs full chunk_frames; subsequent chunks only need
@@ -452,6 +456,7 @@ def _run_realtime_mai_transcription(
             )
 
             results[batch_idx] = ""
+            submit_times[batch_idx] = time.monotonic()
 
             future = pool.submit(
                 _transcribe_chunk, wav_bytes, batch_idx, endpoint, headers, locale, _tenant_id
@@ -463,6 +468,9 @@ def _run_realtime_mai_transcription(
             for f in done:
                 idx, text = f.result()
                 results[idx] = text
+                responses_received += 1
+                if idx in submit_times:
+                    last_latency_ms = (time.monotonic() - submit_times.pop(idx)) * 1000
                 del pending_futures[f]
 
             st.session_state.rt_results = [t for t in results.values() if t]
@@ -474,6 +482,8 @@ def _run_realtime_mai_transcription(
             for future in as_completed(pending_futures):
                 idx, text = future.result()
                 results[idx] = text
+                if idx in submit_times:
+                    submit_times.pop(idx)
                 _render_transcript()
 
     final_lines = [text for text in results.values() if text]

@@ -325,12 +325,16 @@ def _transcribe_chunk(
 
 def _run_realtime_mai_transcription(
     locale: str,
-    chunk_seconds: float = 1.0,
+    chunk_seconds: float = 3.0,
+    overlap_seconds: float = 1.0,
     stop_event: threading.Event | None = None,
 ) -> None:
     """Continuously record audio via a persistent InputStream and transcribe
     micro-batches via the MAI-Transcribe-1 REST API. The microphone stays open
-    for the entire session — no gaps between chunks."""
+    for the entire session — no gaps between chunks.
+
+    Each chunk overlaps the previous one by *overlap_seconds* so words at
+    chunk boundaries are not lost (the model sees them in full context)."""
     import queue
     from collections import OrderedDict
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -377,6 +381,9 @@ def _run_realtime_mai_transcription(
     pending_futures = {}
     batch_idx = 0
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
+    overlap_frames = int(min(overlap_seconds, chunk_seconds * 0.5) * SAMPLE_RATE)
+    # stride_frames is the NEW audio per chunk; the rest is overlap from the previous chunk
+    stride_frames = chunk_frames - overlap_frames
 
     def _render_transcript() -> None:
         lines = [text for text in results.values() if text]
@@ -411,12 +418,15 @@ def _run_realtime_mai_transcription(
 
         while not stop_event.is_set():
             status_placeholder.info(
-                f"\U0001f399\ufe0f Listening \u2014 {chunk_seconds}s chunks\u2026 "
+                f"\U0001f399\ufe0f Listening \u2014 {chunk_seconds}s chunks "
+                f"({overlap_seconds}s overlap)\u2026 "
                 f"({batch_idx} chunks sent)"
             )
 
-            # Accumulate audio from the queue until we have a full chunk
-            while len(audio_buffer) < chunk_frames and not stop_event.is_set():
+            # First chunk needs full chunk_frames; subsequent chunks only need
+            # stride_frames of new audio (the overlap is already in the buffer).
+            needed = chunk_frames if batch_idx == 0 else stride_frames
+            while len(audio_buffer) < needed and not stop_event.is_set():
                 try:
                     block = audio_queue.get(timeout=0.1)
                     audio_buffer = np.concatenate([audio_buffer, block])
@@ -426,9 +436,15 @@ def _run_realtime_mai_transcription(
             if stop_event.is_set():
                 break
 
-            # Slice exactly chunk_frames; keep any overflow for the next chunk
-            chunk_data = audio_buffer[:chunk_frames]
-            audio_buffer = audio_buffer[chunk_frames:]
+            # Take a full chunk_frames window; keep the last overlap_frames
+            # in the buffer so the next chunk shares that audio.
+            if len(audio_buffer) >= chunk_frames:
+                chunk_data = audio_buffer[:chunk_frames]
+                audio_buffer = audio_buffer[stride_frames:]
+            else:
+                # Less than a full chunk (edge case) — send what we have
+                chunk_data = audio_buffer
+                audio_buffer = np.empty(0, dtype=np.int16)
 
             batch_idx += 1
             wav_bytes = _audio_to_wav_bytes(
@@ -806,9 +822,9 @@ with tab_transcribe:
     st.divider()
     st.subheader("⚡ Real-Time Micro-Batch Transcription")
     st.caption(
-        "Continuously records from the default microphone and sends ~1 s audio chunks "
-        "to the MAI-Transcribe-1 REST API in parallel, displaying results as they arrive. "
-        "Toggle the button to start or stop."
+        "Continuously records from the default microphone and sends overlapping audio "
+        "chunks to the MAI-Transcribe-1 REST API in parallel. Longer chunks and overlap "
+        "improve accuracy; shorter chunks reduce latency."
     )
 
     if "rt_stop_event" not in st.session_state:
@@ -820,14 +836,27 @@ with tab_transcribe:
     if "rt_should_start" not in st.session_state:
         st.session_state.rt_should_start = False
 
-    realtime_chunk_seconds = st.slider(
-        "Chunk size (seconds)",
-        min_value=0.5,
-        max_value=3.0,
-        value=1.0,
-        step=0.5,
-        key="realtime_chunk_seconds",
-    )
+    rt_col1, rt_col2 = st.columns(2)
+    with rt_col1:
+        realtime_chunk_seconds = st.slider(
+            "Chunk size (seconds)",
+            min_value=1.0,
+            max_value=10.0,
+            value=3.0,
+            step=0.5,
+            key="realtime_chunk_seconds",
+            help="Audio sent per API call. Longer = better accuracy, slower updates.",
+        )
+    with rt_col2:
+        realtime_overlap_seconds = st.slider(
+            "Overlap (seconds)",
+            min_value=0.0,
+            max_value=min(5.0, realtime_chunk_seconds * 0.5),
+            value=min(1.0, realtime_chunk_seconds * 0.5),
+            step=0.5,
+            key="realtime_overlap_seconds",
+            help="Shared audio between consecutive chunks to prevent word loss at boundaries.",
+        )
 
     toggle_label = "Stop transcription" if st.session_state.rt_recording else "Start transcription"
     toggle_clicked = st.button(toggle_label, type="primary")
@@ -854,6 +883,7 @@ with tab_transcribe:
             _run_realtime_mai_transcription(
                 locale=transcribe_language,
                 chunk_seconds=realtime_chunk_seconds,
+                overlap_seconds=realtime_overlap_seconds,
                 stop_event=st.session_state.rt_stop_event,
             )
         except ValueError as exc:

@@ -305,7 +305,7 @@ def _transcribe_chunk(
         "model": "mai-transcribe-1",
     }
     if prompt:
-        enhanced_mode["prompt"] = prompt
+        enhanced_mode["prompt"] = [prompt]
     if target_locales:
         enhanced_mode["targetLocales"] = target_locales
 
@@ -354,7 +354,8 @@ def _transcribe_chunk(
         return batch_idx, text.strip()
 
     except requests.HTTPError as exc:
-        return batch_idx, f"[Batch {batch_idx} API error {exc.response.status_code}]"
+        body = exc.response.text[:300] if exc.response is not None else ""
+        return batch_idx, f"[Batch {batch_idx} API error {exc.response.status_code}: {body}]"
     except Exception as exc:
         return batch_idx, f"[Batch {batch_idx} error: {exc}]"
 
@@ -763,10 +764,9 @@ def _run_transcription(
             enhanced_mode: dict = {
                         "enabled": True,
                         "task": task,
-                        "model": "mai-transcribe-1",
                     }
             if prompt:
-                enhanced_mode["prompt"] = prompt
+                enhanced_mode["prompt"] = [prompt]
             if target_locales:
                 enhanced_mode["targetLocales"] = target_locales
 
@@ -838,20 +838,29 @@ with tab_transcribe:
         "Language hint",
         options=[
             "en-US",
-            "en-GB",
+            "ar-SA",
+            "cs-CZ",
+            "da-DK",
             "de-DE",
-            "fr-FR",
             "es-ES",
+            "fi-FI",
+            "fr-FR",
+            "hi-IN",
+            "hu-HU",
+            "id-ID",
             "it-IT",
             "ja-JP",
             "ko-KR",
-            "pt-BR",
-            "zh-CN",
             "nl-NL",
             "pl-PL",
+            "pt-BR",
+            "ro-RO",
             "ru-RU",
             "sv-SE",
+            "th-TH",
             "tr-TR",
+            "vi-VN",
+            "zh-CN",
         ],
         index=0,
     )

@@ -858,25 +858,23 @@ with tab_transcribe:
             help="Shared audio between consecutive chunks to prevent word loss at boundaries.",
         )
 
-    toggle_label = "Stop transcription" if st.session_state.rt_recording else "Start transcription"
-    toggle_clicked = st.button(toggle_label, type="primary")
-
-    if toggle_clicked:
+    # Callback runs BEFORE the rerun — state changes are atomic and can't race.
+    def _on_toggle_click():
         if st.session_state.rt_recording:
-            # Stop — signal the recording loop and reset state.
-            # The Streamlit rerun will kill the previous blocking run,
-            # but results were saved incrementally to rt_results.
+            # Stop
             st.session_state.rt_stop_event.set()
             st.session_state.rt_recording = False
         else:
-            # Start — set flag and rerun so the button re-renders as "Stop"
-            st.session_state.rt_stop_event.clear()
+            # Start — create a fresh event and flag recording to begin
+            st.session_state.rt_stop_event = threading.Event()
             st.session_state.rt_recording = True
             st.session_state.rt_results = []
             st.session_state.rt_should_start = True
-            st.rerun()
 
-    # After rerun, the button now shows "Stop transcription" — start the blocking work
+    toggle_label = "Stop transcription" if st.session_state.rt_recording else "Start transcription"
+    st.button(toggle_label, type="primary", on_click=_on_toggle_click)
+
+    # After the callback-triggered rerun, rt_should_start is True → run recording
     if st.session_state.rt_should_start:
         st.session_state.rt_should_start = False
         try:
@@ -890,8 +888,8 @@ with tab_transcribe:
             st.error(str(exc))
         except RuntimeError as exc:
             st.error(str(exc))
-        finally:
-            st.session_state.rt_recording = False
+        # Normal completion or caught error — reset recording state
+        st.session_state.rt_recording = False
 
     # Display previous results if available (persists after stopping)
     if not st.session_state.rt_recording and st.session_state.rt_results:

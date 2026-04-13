@@ -213,16 +213,19 @@ def _build_foundry_headers(auth_method: str, api_key: str, tenant_id: str) -> di
         headers["api-key"] = key
         return headers
 
-    try:
-        token = _get_default_credential(tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to acquire a token with DefaultAzureCredential. "
-            f"{exc}"
-        ) from exc
-
-    headers["Authorization"] = f"Bearer {token}"
-    return headers
+    for attempt in range(2):
+        try:
+            token = _get_default_credential(tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
+            headers["Authorization"] = f"Bearer {token}"
+            return headers
+        except Exception as exc:
+            if attempt == 0:
+                _get_default_credential.clear()
+                continue
+            raise RuntimeError(
+                "Failed to acquire a token with DefaultAzureCredential. "
+                f"{exc}"
+            ) from exc
 
 
 def _build_transcription_headers(subscription_key: str, tenant_id: str) -> dict[str, str]:
@@ -237,15 +240,19 @@ def _build_transcription_headers(subscription_key: str, tenant_id: str) -> dict[
             "Provide either an Azure Speech Key or an Azure Tenant ID for Azure Default Credential."
         )
 
-    try:
-        token = _get_default_credential(normalized_tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to acquire a Microsoft Entra token for MAI-Transcribe-1. "
-            f"{exc}"
-        ) from exc
-
-    return {"Authorization": f"Bearer {token}"}
+    for attempt in range(2):
+        try:
+            token = _get_default_credential(normalized_tenant_id).get_token(_FOUNDRY_TOKEN_SCOPE).token
+            return {"Authorization": f"Bearer {token}"}
+        except Exception as exc:
+            if attempt == 0:
+                # Clear cached credential and retry with a fresh one
+                _get_default_credential.clear()
+                continue
+            raise RuntimeError(
+                "Failed to acquire a Microsoft Entra token for MAI-Transcribe-1. "
+                f"{exc}"
+            ) from exc
 
 
 def _audio_to_wav_bytes(audio_data, sample_rate: int, channels: int) -> bytes:
@@ -1308,12 +1315,16 @@ with tab_transcribe:
             st.session_state.tc_frequency = 5
         if "tc_system_prompt" not in st.session_state:
             st.session_state.tc_system_prompt = (
-                "You are a transcript editor. You receive raw speech-to-text output that "
-                "was produced in micro-batches, so it appears as choppy line-by-line text. "
-                "Clean it up into coherent, readable paragraphs that stay as close to the "
-                "original wording as possible. Remove filler words (uhm, uh, hmm, hmf), "
-                "stuttered repetitions (e.g. 'the the the'), and false starts. "
-                "Do NOT summarize, paraphrase, or add new content. "
+                "You are a transcript editor. You receive raw speech-to-text output produced "
+                "in micro-batches, so it appears as choppy line-by-line fragments. Your job:\n"
+                "1. Merge the fragments into coherent, readable paragraphs.\n"
+                "2. Remove filler words (uhm, uh, hmm, hmf) and stuttered repetitions "
+                "(e.g. 'the the the car' → 'the car').\n"
+                "3. Remove false starts where the speaker restarts a sentence.\n"
+                "4. Keep the original wording intact — do NOT summarize or add new content.\n"
+                "5. When a word is clearly wrong due to a transcription error, keep the "
+                "original word but add the likely correct word after it in brackets, "
+                "e.g. 'we need to dye [dry] the clothes'.\n"
                 "Return ONLY the cleaned transcript text."
             )
         if "tc_cleaned" not in st.session_state:

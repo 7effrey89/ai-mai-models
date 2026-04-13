@@ -12,7 +12,7 @@ A Streamlit playground for testing the three new Microsoft Foundry MAI models:
 
 ## Screenshots
 
-Transcribe "Realtime"-  A custom implementation for real-time speech transcription that dynamically injects contextual prompts to ground the model and improve transcription accuracy.
+Realtime transcription with MAI-Transcribe-1 - A custom implementation for real-time speech transcription that dynamically injects contextual prompts to ground the model and improve transcription accuracy.
 
 **Note**: This model was primarily designed for batch transcription workflows rather than real-time usage. The concept of leveraging dynamic, real-time prompt injection for contextual grounding remains an exploratory idea that could further enhance transcription accuracy in streaming scenarios.
 

@@ -160,7 +160,10 @@ def _get_default_credential(tenant_id: str):
 
     normalized_tenant_id = _normalize_tenant_id(tenant_id)
     if not normalized_tenant_id:
-        return azure_identity.DefaultAzureCredential()
+        return azure_identity.ChainedTokenCredential(
+            azure_identity.DefaultAzureCredential(),
+            azure_identity.InteractiveBrowserCredential(),
+        )
 
     credentials = []
 
@@ -190,6 +193,7 @@ def _get_default_credential(tenant_id: str):
             azure_identity.AzureCliCredential(tenant_id=normalized_tenant_id),
             azure_identity.AzurePowerShellCredential(tenant_id=normalized_tenant_id),
             azure_identity.AzureDeveloperCliCredential(tenant_id=normalized_tenant_id),
+            azure_identity.InteractiveBrowserCredential(tenant_id=normalized_tenant_id),
         ]
     )
 
@@ -369,6 +373,10 @@ def _run_realtime_mai_transcription(
     prompt: str = "",
     target_locales: list[str] | None = None,
     enable_vad: bool = True,
+    ai_prompt_enabled: bool = False,
+    ai_prompt_model: str = "",
+    ai_prompt_system: str = "",
+    ai_prompt_frequency: int = 5,
 ) -> None:
     """Continuously record audio via a persistent InputStream and transcribe
     micro-batches via the MAI-Transcribe-1 REST API. The microphone stays open
@@ -419,7 +427,17 @@ def _run_realtime_mai_transcription(
     headers = _build_transcription_headers(speech_key, _tenant_id)
 
     status_placeholder = st.empty()
+    prompt_placeholder = st.empty()
     transcript_placeholder = st.empty()
+
+    # Show initial AI prompt assistant status
+    if ai_prompt_enabled:
+        prompt_placeholder.info(
+            f"🤖 **AI Prompt Assistant active** — using **{ai_prompt_model}**, "
+            f"will suggest a prompt every {ai_prompt_frequency} chunks. "
+            f"Current prompt: *{prompt or '(none)'}*",
+            icon="🤖",
+        )
 
     results: OrderedDict[int, str] = OrderedDict()
     pending_futures = {}
@@ -428,6 +446,12 @@ def _run_realtime_mai_transcription(
     skipped_silent = 0
     responses_received = 0
     last_latency_ms = 0.0
+    current_prompt = prompt
+    last_prompt_refresh_batch = 0
+    prompt_update_count = 0
+    # Lock to safely update current_prompt from the AI suggestion thread
+    prompt_lock = threading.Lock()
+    ai_prompt_future = None
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
     overlap_frames = int(min(overlap_seconds, chunk_seconds * 0.5) * SAMPLE_RATE)
     # stride_frames is the NEW audio per chunk; the rest is overlap from the previous chunk
@@ -466,11 +490,17 @@ def _run_realtime_mai_transcription(
 
         while not stop_event.is_set():
             vad_label = f" \u2022 {skipped_silent} silent" if enable_vad else ""
+            ai_label = ""
+            if ai_prompt_enabled:
+                next_refresh = last_prompt_refresh_batch + ai_prompt_frequency
+                chunks_until = max(0, next_refresh - batch_idx)
+                ai_label = f" \u2022 \U0001f916 {prompt_update_count} prompt updates (next in {chunks_until} chunks)"
             status_placeholder.info(
                 f"\U0001f399\ufe0f Listening \u2014 {chunk_seconds}s chunks "
                 f"({overlap_seconds}s overlap)\u2026 "
                 f"({batch_idx} sent \u2022 {responses_received} received{vad_label}"
-                f"{f' \u2022 {last_latency_ms:.0f}ms latency' if last_latency_ms else ''})"
+                f"{f' \u2022 {last_latency_ms:.0f}ms latency' if last_latency_ms else ''}"
+                f"{ai_label})"
             )
 
             # First chunk needs full chunk_frames; subsequent chunks only need
@@ -511,7 +541,7 @@ def _run_realtime_mai_transcription(
 
             future = pool.submit(
                 _transcribe_chunk, wav_bytes, batch_idx, endpoint, headers, locale, _tenant_id,
-                task, prompt, target_locales,
+                task, current_prompt, target_locales,
             )
             pending_futures[future] = batch_idx
 
@@ -528,6 +558,50 @@ def _run_realtime_mai_transcription(
             st.session_state.rt_results = [t for t in results.values() if t]
             _render_transcript()
 
+            # --- AI Prompt Assistant: check for completed suggestion ---
+            if ai_prompt_future is not None and ai_prompt_future.done():
+                try:
+                    suggestion = ai_prompt_future.result()
+                    if suggestion:
+                        ai_suggestion = suggestion
+                        # Concatenate user's custom prompt with AI suggestion
+                        if prompt.strip():
+                            current_prompt = f"{prompt.strip()} {ai_suggestion}"
+                        else:
+                            current_prompt = ai_suggestion
+                        prompt_update_count += 1
+                        st.session_state.ap_current_suggestion = ai_suggestion
+                        prompt_placeholder.success(
+                            f"🤖 **Prompt updated** (#{prompt_update_count} at chunk {batch_idx}) "
+                            f"— next update in {ai_prompt_frequency} chunks\n\n"
+                            f"> {ai_suggestion}",
+                            icon="🤖",
+                        )
+                except Exception:
+                    pass
+                ai_prompt_future = None
+
+            # --- AI Prompt Assistant: submit new suggestion request (non-blocking) ---
+            if (
+                ai_prompt_enabled
+                and ai_prompt_model
+                and ai_prompt_future is None
+                and batch_idx - last_prompt_refresh_batch >= ai_prompt_frequency
+            ):
+                transcript_text = "\n".join(t for t in results.values() if t)
+                if transcript_text.strip():
+                    ai_prompt_future = pool.submit(
+                        _suggest_transcription_prompt,
+                        transcript_text,
+                        ai_prompt_system,
+                        ai_prompt_model,
+                        openai_endpoint,
+                        foundry_auth_method,
+                        openai_key,
+                        _tenant_id,
+                    )
+                last_prompt_refresh_batch = batch_idx
+
         # Drain remaining in-flight API calls
         if pending_futures:
             status_placeholder.info("Finishing transcription\u2026")
@@ -540,6 +614,11 @@ def _run_realtime_mai_transcription(
 
     final_lines = [text for text in results.values() if text]
     st.session_state.rt_results = final_lines
+
+    # Queue the last AI suggestion so it shows under the custom prompt on next rerun
+    if ai_prompt_enabled and st.session_state.get("ap_current_suggestion"):
+        st.session_state["_ap_pending_prompt"] = st.session_state["ap_current_suggestion"]
+
     if final_lines:
         status_placeholder.success(
             "Transcription stopped."
@@ -549,6 +628,70 @@ def _run_realtime_mai_transcription(
         status_placeholder.warning(
             "No speech was recognized during the listening window."
         )
+
+
+def _suggest_transcription_prompt(
+    transcript_so_far: str,
+    system_prompt: str,
+    model_deployment: str,
+    foundry_endpoint: str,
+    auth_method: str,
+    api_key: str,
+    tenant_id: str,
+) -> str:
+    """Call a chat completions model to suggest a better transcription prompt
+    based on what has been transcribed so far.  Returns the suggestion text
+    or an empty string on failure."""
+    if not transcript_so_far.strip():
+        return ""
+
+    try:
+        base_endpoint = _normalize_foundry_endpoint(foundry_endpoint)
+        headers = _build_foundry_headers(auth_method, api_key, tenant_id)
+    except (ValueError, RuntimeError) as exc:
+        st.session_state["_ap_last_error"] = f"Auth/endpoint error: {exc}"
+        return ""
+
+    # Try the OpenAI-compatible path first (used by Foundry project endpoints),
+    # fall back to the Azure deployment path.
+    urls_to_try = [
+        f"{base_endpoint}/openai/v1/chat/completions",
+        f"{base_endpoint}/openai/deployments/{model_deployment}/chat/completions?api-version=2024-10-21",
+    ]
+    payload = {
+        "model": model_deployment,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "Here is the transcription so far:\n\n"
+                    f"{transcript_so_far}\n\n"
+                    "Based on this context, suggest a short prompt (1-3 sentences) "
+                    "that will help the speech-to-text model better understand "
+                    "upcoming audio. Return ONLY the prompt text, nothing else."
+                ),
+            },
+        ],
+        "max_completion_tokens": 200,
+        "temperature": 0.7,
+    }
+
+    last_error = ""
+    for url in urls_to_try:
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            resp.raise_for_status()
+            choices = resp.json().get("choices", [])
+            if choices:
+                return choices[0].get("message", {}).get("content", "").strip()
+        except requests.HTTPError as exc:
+            last_error = f"HTTP {exc.response.status_code} at {url}: {exc.response.text[:200]}"
+        except Exception as exc:
+            last_error = f"{url}: {str(exc)[:200]}"
+
+    st.session_state["_ap_last_error"] = last_error
+    return ""
 
 
 def _build_tts_endpoint(speech_tts_endpoint: str, speech_region: str) -> str:
@@ -782,6 +925,7 @@ def _run_transcription(
             }
 
             headers = _build_transcription_headers(speech_key, foundry_tenant_id)
+            transcribe_start = time.monotonic()
             response = requests.post(endpoint, headers=headers, files=files, timeout=120)
 
             # Some Speech resources disable key auth entirely. In that case, retry with Entra.
@@ -794,6 +938,7 @@ def _run_transcription(
                 response = requests.post(endpoint, headers=headers, files=files, timeout=120)
 
             response.raise_for_status()
+            transcribe_elapsed = time.monotonic() - transcribe_start
             result = response.json()
 
             if result.get("text"):
@@ -807,7 +952,7 @@ def _run_transcription(
                     transcript = " ".join(p.get("text", "") for p in phrases)
 
             if transcript:
-                st.success("Transcription complete!")
+                st.success(f"Transcription complete! Latency: {transcribe_elapsed:.2f}s")
                 st.text_area("Transcript", value=transcript, height=200)
             else:
                 st.warning("No transcript text was returned. Raw response:")
@@ -880,9 +1025,14 @@ with tab_transcribe:
             disabled=transcribe_task != "translate",
         )
     with settings_col2:
+        # Apply pending AI prompt suggestion from previous session
+        if "_ap_pending_prompt" in st.session_state:
+            st.session_state["_ap_pending_prompt_display"] = st.session_state.pop("_ap_pending_prompt")
+        if "transcribe_prompt" not in st.session_state:
+            st.session_state.transcribe_prompt = ""
         transcribe_prompt = st.text_area(
             "Custom prompt",
-            value="",
+            key="transcribe_prompt",
             height=100,
             help=(
                 "Custom instructions for the LLM speech model. Use this to specify output "
@@ -891,6 +1041,11 @@ with tab_transcribe:
             ),
             placeholder="e.g. Transcribe in formal English. The speaker discusses cloud computing.",
         )
+        ai_context = st.session_state.get("_ap_pending_prompt_display", "")
+        if ai_context:
+            st.divider()
+            st.caption("🤖 Realtime Prompt Context (from AI assistant)")
+            st.info(ai_context, icon="🤖")
 
     _target_locales = [transcribe_target_locale.strip()] if transcribe_task == "translate" and transcribe_target_locale.strip() else None
 
@@ -1027,6 +1182,71 @@ with tab_transcribe:
             ),
         )
 
+        # -- AI Prompt Assistant (hidden behind a dialog) --
+        if "ap_enabled" not in st.session_state:
+            st.session_state.ap_enabled = False
+        if "ap_model" not in st.session_state:
+            st.session_state.ap_model = "gpt-5.4-nano"
+        if "ap_system_prompt" not in st.session_state:
+            st.session_state.ap_system_prompt = (
+                "You are an expert transcription assistant. Based on the conversation "
+                "transcript provided, generate a concise prompt that will help a "
+                "speech-to-text model better understand the context, domain terminology, "
+                "and speaking style of the ongoing conversation."
+            )
+        if "ap_frequency" not in st.session_state:
+            st.session_state.ap_frequency = 5
+        if "ap_current_suggestion" not in st.session_state:
+            st.session_state.ap_current_suggestion = ""
+
+        # -- AI Prompt Assistant (experimental) --
+        with st.container(border=True):
+            st.markdown("🧪 **Realtime Prompt Context** · _Experimental_")
+            st.caption(
+                "Uses a language model to automatically suggest transcription prompts "
+                "based on what has been said so far. The suggestion is concatenated with "
+                "your Custom prompt and fed to MAI-Transcribe-1 in real-time. "
+                "The model is called via the **Azure AI Foundry Endpoint** in the sidebar."
+            )
+
+            _is_recording = st.session_state.get("rt_recording", False)
+
+            st.session_state.ap_enabled = st.toggle(
+                "Enable AI Prompt Assistant",
+                value=st.session_state.ap_enabled,
+                disabled=_is_recording,
+            )
+
+            ap_col1, ap_col2 = st.columns(2)
+            with ap_col1:
+                st.session_state.ap_model = st.text_input(
+                    "Model deployment name",
+                    value=st.session_state.ap_model,
+                    help="The deployment name of your chat model in Azure AI Foundry (e.g. gpt-5.4-nano).",
+                    disabled=_is_recording,
+                )
+            with ap_col2:
+                st.session_state.ap_frequency = st.slider(
+                    "Suggest every N chunks",
+                    min_value=1,
+                    max_value=20,
+                    value=st.session_state.ap_frequency,
+                    help="How often (in transcription chunks) the AI model is asked to generate a new prompt suggestion.",
+                    disabled=_is_recording,
+                )
+
+            st.session_state.ap_system_prompt = st.text_area(
+                "System prompt for the AI model",
+                value=st.session_state.ap_system_prompt,
+                height=100,
+                help="Instructions sent to the language model when generating prompt suggestions.",
+                disabled=_is_recording,
+            )
+
+            if st.session_state.ap_current_suggestion:
+                st.caption("Current AI-suggested prompt:")
+                st.code(st.session_state.ap_current_suggestion, language="text")
+
         # Callback runs BEFORE the rerun — state changes are atomic and can't race.
         def _on_toggle_click():
             if st.session_state.rt_recording:
@@ -1056,6 +1276,10 @@ with tab_transcribe:
                     prompt=transcribe_prompt,
                     target_locales=_target_locales,
                     enable_vad=realtime_enable_vad,
+                    ai_prompt_enabled=st.session_state.ap_enabled,
+                    ai_prompt_model=st.session_state.ap_model,
+                    ai_prompt_system=st.session_state.ap_system_prompt,
+                    ai_prompt_frequency=st.session_state.ap_frequency,
                 )
             except ValueError as exc:
                 st.error(str(exc))
@@ -1085,15 +1309,14 @@ with tab_voice:
         height=120,
     )
 
-    # Known MAI-Voice-1 voices (en-US only for now)
+    # Known MAI-Voice-1 prebuilt voices (en-US only for now)
     voice_options = {
-        "Grant (en-US)": "en-US-Grant:MAI-Voice-1",
-        "Teo (en-US)": "en-US-Teo:MAI-Voice-1",
-        "Ava (en-US)": "en-US-Ava:MAI-Voice-1",
-        "Andrew (en-US)": "en-US-Andrew:MAI-Voice-1",
-        "Emma (en-US)": "en-US-Emma:MAI-Voice-1",
-        "Brian (en-US)": "en-US-Brian:MAI-Voice-1",
-        "Jenny (en-US)": "en-US-Jenny:MAI-Voice-1",
+        "Jasper (en-US, Male)": "en-us-Jasper:MAI-Voice-1",
+        "June (en-US, Female)": "en-us-June:MAI-Voice-1",
+        "Grant (en-US, Male)": "en-us-Grant:MAI-Voice-1",
+        "Iris (en-US, Female)": "en-us-Iris:MAI-Voice-1",
+        "Reed (en-US, Male)": "en-us-Reed:MAI-Voice-1",
+        "Joy (en-US, Female)": "en-us-Joy:MAI-Voice-1",
     }
 
     selected_voice_label = st.selectbox("Voice", options=list(voice_options.keys()), index=0)
@@ -1141,6 +1364,7 @@ with tab_voice:
                 )
 
                 try:
+                    tts_start = time.monotonic()
                     tts_response = requests.post(
                         tts_endpoint,
                         headers=tts_headers,
@@ -1173,11 +1397,12 @@ with tab_voice:
                             st.stop()
 
                     tts_response.raise_for_status()
+                    tts_elapsed = time.monotonic() - tts_start
 
                     audio_bytes = tts_response.content
                     ext = "mp3" if "mp3" in output_format else "wav"
                     mime = "audio/mpeg" if ext == "mp3" else "audio/wav"
-                    st.success("Synthesis complete!")
+                    st.success(f"Synthesis complete! Latency: {tts_elapsed:.2f}s")
                     st.audio(audio_bytes, format=mime)
 
                     st.download_button(
@@ -1274,6 +1499,7 @@ with tab_image:
                 }
 
                 try:
+                    img_start = time.monotonic()
                     img_response = requests.post(
                         url,
                         headers=headers,
@@ -1281,6 +1507,7 @@ with tab_image:
                         timeout=120,
                     )
                     img_response.raise_for_status()
+                    img_elapsed = time.monotonic() - img_start
                     result = img_response.json()
 
                     images_data = result.get("data", [])
@@ -1289,7 +1516,7 @@ with tab_image:
                         st.json(result)
                     else:
                         st.success(
-                            f"Generated {len(images_data)} image(s) successfully!"
+                            f"Generated {len(images_data)} image(s) successfully! Latency: {img_elapsed:.2f}s"
                         )
                         for idx, img_data in enumerate(images_data):
                             image_url = img_data.get("url")

@@ -19,6 +19,12 @@ A custom implementation for real-time speech transcription that dynamically inje
 
 <img width="1198" height="687" alt="image" src="https://github.com/user-attachments/assets/c44b1d49-a493-4f67-ab38-a86e9d09b3f8" />
 
+### Realtime transcription with MAI-Transcribe-1 and post-cleaning for even better transcripts
+Uses AI (Small language model) to clean up the transcript for increased readability by merging into paraphas and removing human stuttering from the transcript. 
+At the right side im reading a random text passage for testing the quality. Quality of the transcript is also affected by pronounciation - im sure i could have made the transcript really good, but this seems to reflect the real world quite good. 
+<img width="3228" height="1270" alt="image" src="https://github.com/user-attachments/assets/92e7486d-d4b7-4f95-b410-790e63540d2a" />
+
+
 ### Transcribe a recording with prompt support to provide context with MAI-Transcribe-1
 <img width="1235" height="707" alt="image" src="https://github.com/user-attachments/assets/70241f2a-870d-4aa9-8044-8d5224068989" />
 

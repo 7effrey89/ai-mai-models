@@ -377,6 +377,10 @@ def _run_realtime_mai_transcription(
     ai_prompt_model: str = "",
     ai_prompt_system: str = "",
     ai_prompt_frequency: int = 5,
+    tc_enabled: bool = False,
+    tc_model: str = "",
+    tc_system: str = "",
+    tc_frequency: int = 5,
 ) -> None:
     """Continuously record audio via a persistent InputStream and transcribe
     micro-batches via the MAI-Transcribe-1 REST API. The microphone stays open
@@ -428,7 +432,19 @@ def _run_realtime_mai_transcription(
 
     status_placeholder = st.empty()
     prompt_placeholder = st.empty()
-    transcript_placeholder = st.empty()
+
+    # Side-by-side transcript layout when cleanup is enabled
+    if tc_enabled:
+        _raw_col, _clean_col = st.columns(2)
+        with _raw_col:
+            st.caption("📝 Raw Transcript")
+            transcript_placeholder = st.empty()
+        with _clean_col:
+            st.caption("🧹 Cleaned Transcript")
+            cleaned_placeholder = st.empty()
+    else:
+        transcript_placeholder = st.empty()
+        cleaned_placeholder = st.empty()
 
     # Show initial AI prompt assistant status
     if ai_prompt_enabled:
@@ -452,6 +468,8 @@ def _run_realtime_mai_transcription(
     # Lock to safely update current_prompt from the AI suggestion thread
     prompt_lock = threading.Lock()
     ai_prompt_future = None
+    tc_future = None
+    last_tc_batch = 0
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
     overlap_frames = int(min(overlap_seconds, chunk_seconds * 0.5) * SAMPLE_RATE)
     # stride_frames is the NEW audio per chunk; the rest is overlap from the previous chunk
@@ -602,6 +620,38 @@ def _run_realtime_mai_transcription(
                     )
                 last_prompt_refresh_batch = batch_idx
 
+            # --- Transcript Cleanup: check for completed cleanup ---
+            if tc_future is not None and tc_future.done():
+                try:
+                    cleaned = tc_future.result()
+                    if cleaned:
+                        st.session_state.tc_cleaned = cleaned
+                        cleaned_placeholder.markdown(cleaned)
+                except Exception:
+                    pass
+                tc_future = None
+
+            # --- Transcript Cleanup: submit new cleanup request (non-blocking) ---
+            if (
+                tc_enabled
+                and tc_model
+                and tc_future is None
+                and batch_idx - last_tc_batch >= tc_frequency
+            ):
+                transcript_text_for_cleanup = "\n".join(t for t in results.values() if t)
+                if transcript_text_for_cleanup.strip():
+                    tc_future = pool.submit(
+                        _cleanup_transcript,
+                        transcript_text_for_cleanup,
+                        tc_system,
+                        tc_model,
+                        openai_endpoint,
+                        foundry_auth_method,
+                        openai_key,
+                        _tenant_id,
+                    )
+                last_tc_batch = batch_idx
+
         # Drain remaining in-flight API calls
         if pending_futures:
             status_placeholder.info("Finishing transcription\u2026")
@@ -691,6 +741,52 @@ def _suggest_transcription_prompt(
             last_error = f"{url}: {str(exc)[:200]}"
 
     st.session_state["_ap_last_error"] = last_error
+    return ""
+
+
+def _cleanup_transcript(
+    raw_transcript: str,
+    system_prompt: str,
+    model_deployment: str,
+    foundry_endpoint: str,
+    auth_method: str,
+    api_key: str,
+    tenant_id: str,
+) -> str:
+    """Call a chat model to clean up micro-batched transcript lines into
+    coherent, readable paragraphs. Returns the cleaned text or empty string."""
+    if not raw_transcript.strip():
+        return ""
+
+    try:
+        base_endpoint = _normalize_foundry_endpoint(foundry_endpoint)
+        headers = _build_foundry_headers(auth_method, api_key, tenant_id)
+    except (ValueError, RuntimeError):
+        return ""
+
+    urls_to_try = [
+        f"{base_endpoint}/openai/v1/chat/completions",
+        f"{base_endpoint}/openai/deployments/{model_deployment}/chat/completions?api-version=2024-10-21",
+    ]
+    payload = {
+        "model": model_deployment,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": raw_transcript},
+        ],
+        "max_completion_tokens": 2000,
+        "temperature": 0.3,
+    }
+
+    for url in urls_to_try:
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            resp.raise_for_status()
+            choices = resp.json().get("choices", [])
+            if choices:
+                return choices[0].get("message", {}).get("content", "").strip()
+        except Exception:
+            pass
     return ""
 
 
@@ -979,36 +1075,40 @@ with tab_transcribe:
         icon="ℹ️",
     )
 
-    transcribe_language = st.selectbox(
+    _LANGUAGE_OPTIONS = [
+        "🗽 US English (en-US)",
+        "🕌 Arabic (ar-SA)",
+        "🏰 Czech (cs-CZ)",
+        "⚓ Danish (da-DK)",
+        "🍺 German (de-DE)",
+        "💃 Spanish (es-ES)",
+        "🧖 Finnish (fi-FI)",
+        "🥖 French (fr-FR)",
+        "🪷 Hindi (hi-IN)",
+        "🌶️ Hungarian (hu-HU)",
+        "🌴 Indonesian (id-ID)",
+        "🍕 Italian (it-IT)",
+        "⛩️ Japanese (ja-JP)",
+        "🥢 Korean (ko-KR)",
+        "🌷 Dutch (nl-NL)",
+        "🦬 Polish (pl-PL)",
+        "⚽ Portuguese BR (pt-BR)",
+        "🏔️ Romanian (ro-RO)",
+        "🪆 Russian (ru-RU)",
+        "🫎 Swedish (sv-SE)",
+        "🐘 Thai (th-TH)",
+        "🧿 Turkish (tr-TR)",
+        "🍜 Vietnamese (vi-VN)",
+        "🐉 Chinese (zh-CN)",
+    ]
+
+    transcribe_language_display = st.selectbox(
         "Language hint",
-        options=[
-            "en-US",
-            "ar-SA",
-            "cs-CZ",
-            "da-DK",
-            "de-DE",
-            "es-ES",
-            "fi-FI",
-            "fr-FR",
-            "hi-IN",
-            "hu-HU",
-            "id-ID",
-            "it-IT",
-            "ja-JP",
-            "ko-KR",
-            "nl-NL",
-            "pl-PL",
-            "pt-BR",
-            "ro-RO",
-            "ru-RU",
-            "sv-SE",
-            "th-TH",
-            "tr-TR",
-            "vi-VN",
-            "zh-CN",
-        ],
+        options=_LANGUAGE_OPTIONS,
         index=0,
     )
+    # Extract the locale code from parentheses, e.g. "🍺 German (de-DE)" → "de-DE"
+    transcribe_language = transcribe_language_display.split("(")[1].rstrip(")")
 
     settings_col1, settings_col2 = st.columns(2)
     with settings_col1:
@@ -1184,7 +1284,7 @@ with tab_transcribe:
 
         # -- AI Prompt Assistant (hidden behind a dialog) --
         if "ap_enabled" not in st.session_state:
-            st.session_state.ap_enabled = False
+            st.session_state.ap_enabled = True
         if "ap_model" not in st.session_state:
             st.session_state.ap_model = "gpt-5.4-nano"
         if "ap_system_prompt" not in st.session_state:
@@ -1199,53 +1299,126 @@ with tab_transcribe:
         if "ap_current_suggestion" not in st.session_state:
             st.session_state.ap_current_suggestion = ""
 
-        # -- AI Prompt Assistant (experimental) --
-        with st.container(border=True):
-            st.markdown("🧪 **Realtime Prompt Context** · _Experimental_")
-            st.caption(
-                "Uses a language model to automatically suggest transcription prompts "
-                "based on what has been said so far. The suggestion is concatenated with "
-                "your Custom prompt and fed to MAI-Transcribe-1 in real-time. "
-                "The model is called via the **Azure AI Foundry Endpoint** in the sidebar."
+        # -- Experimental sections side by side --
+        if "tc_enabled" not in st.session_state:
+            st.session_state.tc_enabled = True
+        if "tc_model" not in st.session_state:
+            st.session_state.tc_model = "gpt-5.4-nano"
+        if "tc_frequency" not in st.session_state:
+            st.session_state.tc_frequency = 5
+        if "tc_system_prompt" not in st.session_state:
+            st.session_state.tc_system_prompt = (
+                "You are a transcript editor. You receive raw speech-to-text output that "
+                "was produced in micro-batches, so it appears as choppy line-by-line text. "
+                "Clean it up into coherent, readable paragraphs that stay as close to the "
+                "original wording as possible. Remove filler words (uhm, uh, hmm, hmf), "
+                "stuttered repetitions (e.g. 'the the the'), and false starts. "
+                "Do NOT summarize, paraphrase, or add new content. "
+                "Return ONLY the cleaned transcript text."
             )
+        if "tc_cleaned" not in st.session_state:
+            st.session_state.tc_cleaned = ""
 
-            _is_recording = st.session_state.get("rt_recording", False)
+        exp_col1, exp_col2 = st.columns(2)
 
-            st.session_state.ap_enabled = st.toggle(
-                "Enable AI Prompt Assistant",
-                value=st.session_state.ap_enabled,
-                disabled=_is_recording,
-            )
-
-            ap_col1, ap_col2 = st.columns(2)
-            with ap_col1:
-                st.session_state.ap_model = st.text_input(
-                    "Model deployment name",
-                    value=st.session_state.ap_model,
-                    help="The deployment name of your chat model in Azure AI Foundry (e.g. gpt-5.4-nano).",
-                    disabled=_is_recording,
-                )
-            with ap_col2:
-                st.session_state.ap_frequency = st.slider(
-                    "Suggest every N chunks",
-                    min_value=1,
-                    max_value=20,
-                    value=st.session_state.ap_frequency,
-                    help="How often (in transcription chunks) the AI model is asked to generate a new prompt suggestion.",
-                    disabled=_is_recording,
+        # -- Left: AI Prompt Assistant --
+        with exp_col1:
+            with st.container(border=True):
+                st.markdown("🧪 **Realtime Prompt Context** · _Experimental_")
+                st.caption(
+                    "Uses a language model to automatically suggest transcription prompts "
+                    "based on what has been said so far. The suggestion is concatenated with "
+                    "your Custom prompt and fed to MAI-Transcribe-1 in real-time. "
+                    "The model is called via the **Azure AI Foundry Endpoint** in the sidebar."
                 )
 
-            st.session_state.ap_system_prompt = st.text_area(
-                "System prompt for the AI model",
-                value=st.session_state.ap_system_prompt,
-                height=100,
-                help="Instructions sent to the language model when generating prompt suggestions.",
-                disabled=_is_recording,
-            )
+                _is_recording = st.session_state.get("rt_recording", False)
 
-            if st.session_state.ap_current_suggestion:
-                st.caption("Current AI-suggested prompt:")
-                st.code(st.session_state.ap_current_suggestion, language="text")
+                st.session_state.ap_enabled = st.toggle(
+                    "Enable AI Prompt Assistant",
+                    value=st.session_state.ap_enabled,
+                    disabled=_is_recording,
+                )
+
+                ap_col1, ap_col2 = st.columns(2)
+                with ap_col1:
+                    st.session_state.ap_model = st.text_input(
+                        "Model deployment name",
+                        value=st.session_state.ap_model,
+                        help="The deployment name of your chat model in Azure AI Foundry (e.g. gpt-5.4-nano).",
+                        disabled=_is_recording,
+                    )
+                with ap_col2:
+                    st.session_state.ap_frequency = st.slider(
+                        "Suggest every N chunks",
+                        min_value=1,
+                        max_value=20,
+                        value=st.session_state.ap_frequency,
+                        help="How often (in transcription chunks) the AI model is asked to generate a new prompt suggestion.",
+                        disabled=_is_recording,
+                    )
+
+                st.session_state.ap_system_prompt = st.text_area(
+                    "System prompt for the AI model",
+                    value=st.session_state.ap_system_prompt,
+                    height=100,
+                    help="Instructions sent to the language model when generating prompt suggestions.",
+                    disabled=_is_recording,
+                )
+
+                if st.session_state.ap_current_suggestion:
+                    st.caption("Current AI-applied prompt:")
+                    st.markdown(
+                        f'<div style="white-space:pre-wrap;word-wrap:break-word;background:#f0f2f6;'
+                        f'padding:0.5rem 0.75rem;border-radius:0.5rem;font-size:0.85rem;">'
+                        f'{st.session_state.ap_current_suggestion}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # -- Right: Transcript Cleanup --
+        with exp_col2:
+            with st.container(border=True):
+                st.markdown("🧹 **Transcript Cleanup** · _Experimental_")
+                st.caption(
+                    "Uses a language model to merge choppy micro-batch lines into readable "
+                    "paragraphs. Removes filler words (uhm, hmm), stuttered repetitions, "
+                    "and false starts while staying as close to the original as possible."
+                )
+
+                st.session_state.tc_enabled = st.toggle(
+                    "Enable Transcript Cleanup",
+                    value=st.session_state.tc_enabled,
+                    disabled=_is_recording,
+                )
+
+                tc_col1, tc_col2 = st.columns(2)
+                with tc_col1:
+                    st.session_state.tc_model = st.text_input(
+                        "Model deployment name",
+                        value=st.session_state.tc_model,
+                        help="The deployment name of your chat model in Azure AI Foundry (e.g. gpt-5.4-nano).",
+                        disabled=_is_recording,
+                        key="tc_model_input",
+                    )
+                with tc_col2:
+                    st.session_state.tc_frequency = st.slider(
+                        "Clean up every N chunks",
+                        min_value=2,
+                        max_value=20,
+                        value=st.session_state.tc_frequency,
+                        help="How often (in transcription chunks) the transcript is cleaned up.",
+                        disabled=_is_recording,
+                        key="tc_frequency_slider",
+                    )
+
+                st.session_state.tc_system_prompt = st.text_area(
+                    "System prompt for cleanup",
+                    value=st.session_state.tc_system_prompt,
+                    height=100,
+                    help="Instructions sent to the language model for transcript cleanup.",
+                    disabled=_is_recording,
+                    key="tc_system_prompt_input",
+                )
 
         # Callback runs BEFORE the rerun — state changes are atomic and can't race.
         def _on_toggle_click():
@@ -1280,6 +1453,10 @@ with tab_transcribe:
                     ai_prompt_model=st.session_state.ap_model,
                     ai_prompt_system=st.session_state.ap_system_prompt,
                     ai_prompt_frequency=st.session_state.ap_frequency,
+                    tc_enabled=st.session_state.tc_enabled,
+                    tc_model=st.session_state.tc_model,
+                    tc_system=st.session_state.tc_system_prompt,
+                    tc_frequency=st.session_state.tc_frequency,
                 )
             except ValueError as exc:
                 st.error(str(exc))
@@ -1290,7 +1467,16 @@ with tab_transcribe:
 
         # Display previous results if available (persists after stopping)
         if not st.session_state.rt_recording and st.session_state.rt_results:
-            st.code("\n".join(st.session_state.rt_results), language="text")
+            if st.session_state.tc_enabled and st.session_state.tc_cleaned:
+                raw_col, clean_col = st.columns(2)
+                with raw_col:
+                    st.caption("📝 Raw Transcript")
+                    st.code("\n".join(st.session_state.rt_results), language="text")
+                with clean_col:
+                    st.caption("🧹 Cleaned Transcript")
+                    st.markdown(st.session_state.tc_cleaned)
+            else:
+                st.code("\n".join(st.session_state.rt_results), language="text")
 
 # ===========================================================================
 # TAB 2 – MAI-Voice-1  (text → speech)

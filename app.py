@@ -160,7 +160,10 @@ def _get_default_credential(tenant_id: str):
 
     normalized_tenant_id = _normalize_tenant_id(tenant_id)
     if not normalized_tenant_id:
-        return azure_identity.DefaultAzureCredential()
+        return azure_identity.ChainedTokenCredential(
+            azure_identity.DefaultAzureCredential(),
+            azure_identity.InteractiveBrowserCredential(),
+        )
 
     credentials = []
 
@@ -190,6 +193,7 @@ def _get_default_credential(tenant_id: str):
             azure_identity.AzureCliCredential(tenant_id=normalized_tenant_id),
             azure_identity.AzurePowerShellCredential(tenant_id=normalized_tenant_id),
             azure_identity.AzureDeveloperCliCredential(tenant_id=normalized_tenant_id),
+            azure_identity.InteractiveBrowserCredential(tenant_id=normalized_tenant_id),
         ]
     )
 
@@ -782,6 +786,7 @@ def _run_transcription(
             }
 
             headers = _build_transcription_headers(speech_key, foundry_tenant_id)
+            transcribe_start = time.monotonic()
             response = requests.post(endpoint, headers=headers, files=files, timeout=120)
 
             # Some Speech resources disable key auth entirely. In that case, retry with Entra.
@@ -794,6 +799,7 @@ def _run_transcription(
                 response = requests.post(endpoint, headers=headers, files=files, timeout=120)
 
             response.raise_for_status()
+            transcribe_elapsed = time.monotonic() - transcribe_start
             result = response.json()
 
             if result.get("text"):
@@ -807,7 +813,7 @@ def _run_transcription(
                     transcript = " ".join(p.get("text", "") for p in phrases)
 
             if transcript:
-                st.success("Transcription complete!")
+                st.success(f"Transcription complete! Latency: {transcribe_elapsed:.2f}s")
                 st.text_area("Transcript", value=transcript, height=200)
             else:
                 st.warning("No transcript text was returned. Raw response:")
@@ -1140,6 +1146,7 @@ with tab_voice:
                 )
 
                 try:
+                    tts_start = time.monotonic()
                     tts_response = requests.post(
                         tts_endpoint,
                         headers=tts_headers,
@@ -1172,11 +1179,12 @@ with tab_voice:
                             st.stop()
 
                     tts_response.raise_for_status()
+                    tts_elapsed = time.monotonic() - tts_start
 
                     audio_bytes = tts_response.content
                     ext = "mp3" if "mp3" in output_format else "wav"
                     mime = "audio/mpeg" if ext == "mp3" else "audio/wav"
-                    st.success("Synthesis complete!")
+                    st.success(f"Synthesis complete! Latency: {tts_elapsed:.2f}s")
                     st.audio(audio_bytes, format=mime)
 
                     st.download_button(
@@ -1273,6 +1281,7 @@ with tab_image:
                 }
 
                 try:
+                    img_start = time.monotonic()
                     img_response = requests.post(
                         url,
                         headers=headers,
@@ -1280,6 +1289,7 @@ with tab_image:
                         timeout=120,
                     )
                     img_response.raise_for_status()
+                    img_elapsed = time.monotonic() - img_start
                     result = img_response.json()
 
                     images_data = result.get("data", [])
@@ -1288,7 +1298,7 @@ with tab_image:
                         st.json(result)
                     else:
                         st.success(
-                            f"Generated {len(images_data)} image(s) successfully!"
+                            f"Generated {len(images_data)} image(s) successfully! Latency: {img_elapsed:.2f}s"
                         )
                         for idx, img_data in enumerate(images_data):
                             image_url = img_data.get("url")

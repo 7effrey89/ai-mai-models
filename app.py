@@ -1085,15 +1085,14 @@ with tab_voice:
         height=120,
     )
 
-    # Known MAI-Voice-1 voices (en-US only for now)
+    # Known MAI-Voice-1 prebuilt voices (en-US only for now)
     voice_options = {
-        "Grant (en-US)": "en-US-Grant:MAI-Voice-1",
-        "Teo (en-US)": "en-US-Teo:MAI-Voice-1",
-        "Ava (en-US)": "en-US-Ava:MAI-Voice-1",
-        "Andrew (en-US)": "en-US-Andrew:MAI-Voice-1",
-        "Emma (en-US)": "en-US-Emma:MAI-Voice-1",
-        "Brian (en-US)": "en-US-Brian:MAI-Voice-1",
-        "Jenny (en-US)": "en-US-Jenny:MAI-Voice-1",
+        "Jasper (en-US, Male)": "en-us-Jasper:MAI-Voice-1",
+        "June (en-US, Female)": "en-us-June:MAI-Voice-1",
+        "Grant (en-US, Male)": "en-us-Grant:MAI-Voice-1",
+        "Iris (en-US, Female)": "en-us-Iris:MAI-Voice-1",
+        "Reed (en-US, Male)": "en-us-Reed:MAI-Voice-1",
+        "Joy (en-US, Female)": "en-us-Joy:MAI-Voice-1",
     }
 
     selected_voice_label = st.selectbox("Voice", options=list(voice_options.keys()), index=0)

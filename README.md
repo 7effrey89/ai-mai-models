@@ -12,19 +12,20 @@ A Streamlit playground for testing the three new Microsoft Foundry MAI models:
 
 ## Screenshots
 
-Realtime transcription with MAI-Transcribe-1 - A custom implementation for real-time speech transcription that dynamically injects contextual prompts to ground the model and improve transcription accuracy.
+### Realtime transcription with MAI-Transcribe-1
+A custom implementation for real-time speech transcription that dynamically injects contextual prompts to ground the model and improve transcription accuracy.
 
 **Note**: This model was primarily designed for batch transcription workflows rather than real-time usage. The concept of leveraging dynamic, real-time prompt injection for contextual grounding remains an exploratory idea that could further enhance transcription accuracy in streaming scenarios.
 
 <img width="1198" height="687" alt="image" src="https://github.com/user-attachments/assets/c44b1d49-a493-4f67-ab38-a86e9d09b3f8" />
 
-Transcribe a recording with prompt support to provide context
+### Transcribe a recording with prompt support to provide context with MAI-Transcribe-1
 <img width="1235" height="707" alt="image" src="https://github.com/user-attachments/assets/70241f2a-870d-4aa9-8044-8d5224068989" />
 
-Voice Mode (Text to Voice)
+### Voice Mode (Text to Voice) with MAI-Voice-1
 <img width="2484" height="1419" alt="image" src="https://github.com/user-attachments/assets/998e1f7b-d5b6-4721-a2ea-230cdcdf35f2" />
 
-Image generation
+### Image generation with MAI-Image-2
 <img width="2486" height="1414" alt="image" src="https://github.com/user-attachments/assets/fccca49c-8981-4369-a3f6-1e9904fc1a68" />
 
 

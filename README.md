@@ -12,7 +12,15 @@ A Streamlit playground for testing the three new Microsoft Foundry MAI models:
 
 ## Screenshots
 
-![Playground tabs](https://i.imgur.com/placeholder.png)
+Transcribe - My custom implementation for handling realtime transcription. Note the intend with this model was to use it as as a batch transcription mode rather than realtime.. 
+<img width="2484" height="1420" alt="image" src="https://github.com/user-attachments/assets/4c95edbb-3a81-4852-81a9-b14366f4aed0" />
+
+Voice Mode (Text to Voice)
+<img width="2484" height="1419" alt="image" src="https://github.com/user-attachments/assets/998e1f7b-d5b6-4721-a2ea-230cdcdf35f2" />
+
+Image generation
+<img width="2486" height="1414" alt="image" src="https://github.com/user-attachments/assets/fccca49c-8981-4369-a3f6-1e9904fc1a68" />
+
 
 ## Prerequisites
 

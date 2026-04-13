@@ -894,19 +894,57 @@ with tab_transcribe:
 
     _target_locales = [transcribe_target_locale.strip()] if transcribe_task == "translate" and transcribe_target_locale.strip() else None
 
-    input_col1, input_col2 = st.columns(2)
+    st.markdown(
+        """
+        <style>
+        /* Prominent tabs with border and highlight */
+        div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.5rem;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 0;
+        }
+        div[data-testid="stTabs"] button[data-baseweb="tab"] {
+            font-size: 1.1rem;
+            font-weight: 600;
+            padding: 0.75rem 1.5rem;
+            border: 2px solid #e0e0e0;
+            border-bottom: none;
+            border-radius: 0.5rem 0.5rem 0 0;
+            background-color: #f8f9fa;
+            transition: background-color 0.2s;
+        }
+        div[data-testid="stTabs"] button[data-baseweb="tab"]:hover {
+            background-color: #e8f0fe;
+        }
+        div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: #dbeafe;
+            border-color: #4a90d9;
+            color: #1a56db;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    demo_record, demo_upload, demo_realtime = st.tabs([
+        "🎤 Demo 1 — Record & Transcribe",
+        "📂 Demo 2 — Upload & Transcribe",
+        "⚡ Demo 3 — Real-Time Transcription",
+    ])
 
     # ------------------------------------------------------------------
-    # Option A – Record from microphone
+    # Demo 1 – Record from microphone
     # ------------------------------------------------------------------
-    with input_col1:
+    with demo_record:
         st.subheader("🎤 Record from microphone")
         st.caption(
-            "Click the microphone icon to start recording. "
-            "Click stop when you're done — transcription starts automatically."
+            "Click the 🎙️ microphone icon below to start recording. "
+            "Click stop when you're done, then click **Transcribe recording** to transcribe."
         )
-        mic_audio = st.audio_input("Record audio", label_visibility="collapsed")
-        if mic_audio is not None:
+        mic_audio = st.audio_input("🎙️ Click to record", key="mic_record")
+        if st.button("Transcribe recording", type="primary", disabled=mic_audio is None, key="btn_transcribe_mic"):
             _run_transcription(
                 audio_bytes=mic_audio.getvalue(),
                 filename="recording.wav",
@@ -918,16 +956,16 @@ with tab_transcribe:
             )
 
     # ------------------------------------------------------------------
-    # Option B – Upload an existing audio file
+    # Demo 2 – Upload an existing audio file
     # ------------------------------------------------------------------
-    with input_col2:
+    with demo_upload:
         st.subheader("📂 Upload an audio file")
         audio_file = st.file_uploader(
             "Upload audio file",
             type=["wav", "mp3", "flac", "ogg", "m4a"],
             label_visibility="collapsed",
         )
-        if st.button("Transcribe uploaded file", type="primary", disabled=audio_file is None):
+        if st.button("Transcribe uploaded file", type="primary", disabled=audio_file is None, key="btn_transcribe_upload"):
             _run_transcription(
                 audio_bytes=audio_file.getvalue(),
                 filename=audio_file.name,
@@ -938,94 +976,97 @@ with tab_transcribe:
                 target_locales=_target_locales,
             )
 
-    st.divider()
-    st.subheader("⚡ Real-Time Micro-Batch Transcription")
-    st.caption(
-        "Continuously records from the default microphone and sends overlapping audio "
-        "chunks to the MAI-Transcribe-1 REST API in parallel. Longer chunks and overlap "
-        "improve accuracy; shorter chunks reduce latency."
-    )
-
-    if "rt_stop_event" not in st.session_state:
-        st.session_state.rt_stop_event = threading.Event()
-    if "rt_recording" not in st.session_state:
-        st.session_state.rt_recording = False
-    if "rt_results" not in st.session_state:
-        st.session_state.rt_results = []
-    if "rt_should_start" not in st.session_state:
-        st.session_state.rt_should_start = False
-
-    rt_col1, rt_col2 = st.columns(2)
-    with rt_col1:
-        realtime_chunk_seconds = st.slider(
-            "Chunk size (seconds)",
-            min_value=1.0,
-            max_value=10.0,
-            value=3.0,
-            step=0.5,
-            key="realtime_chunk_seconds",
-            help="Audio sent per API call. Longer = better accuracy, slower updates.",
-        )
-    with rt_col2:
-        realtime_overlap_seconds = st.slider(
-            "Overlap (seconds)",
-            min_value=0.0,
-            max_value=min(5.0, realtime_chunk_seconds * 0.5),
-            value=min(1.0, realtime_chunk_seconds * 0.5),
-            step=0.5,
-            key="realtime_overlap_seconds",
-            help="Shared audio between consecutive chunks to prevent word loss at boundaries.",
+    # ------------------------------------------------------------------
+    # Demo 3 – Real-Time Micro-Batch Transcription
+    # ------------------------------------------------------------------
+    with demo_realtime:
+        st.subheader("⚡ Real-Time Micro-Batch Transcription")
+        st.caption(
+            "Continuously records from the default microphone and sends overlapping audio "
+            "chunks to the MAI-Transcribe-1 REST API in parallel. Longer chunks and overlap "
+            "improve accuracy; shorter chunks reduce latency."
         )
 
-    realtime_enable_vad = st.checkbox(
-        "Skip silent chunks (VAD)",
-        value=True,
-        help=(
-            "Uses voice activity detection to skip silent audio chunks, reducing API calls "
-            "and cost. Requires the `webrtcvad` package; falls back to sending all chunks if not installed."
-        ),
-    )
-
-    # Callback runs BEFORE the rerun — state changes are atomic and can't race.
-    def _on_toggle_click():
-        if st.session_state.rt_recording:
-            # Stop
-            st.session_state.rt_stop_event.set()
-            st.session_state.rt_recording = False
-        else:
-            # Start — create a fresh event and flag recording to begin
+        if "rt_stop_event" not in st.session_state:
             st.session_state.rt_stop_event = threading.Event()
-            st.session_state.rt_recording = True
+        if "rt_recording" not in st.session_state:
+            st.session_state.rt_recording = False
+        if "rt_results" not in st.session_state:
             st.session_state.rt_results = []
-            st.session_state.rt_should_start = True
+        if "rt_should_start" not in st.session_state:
+            st.session_state.rt_should_start = False
 
-    toggle_label = "Stop transcription" if st.session_state.rt_recording else "Start transcription"
-    st.button(toggle_label, type="primary", on_click=_on_toggle_click)
-
-    # After the callback-triggered rerun, rt_should_start is True → run recording
-    if st.session_state.rt_should_start:
-        st.session_state.rt_should_start = False
-        try:
-            _run_realtime_mai_transcription(
-                locale=transcribe_language,
-                chunk_seconds=realtime_chunk_seconds,
-                overlap_seconds=realtime_overlap_seconds,
-                stop_event=st.session_state.rt_stop_event,
-                task=transcribe_task,
-                prompt=transcribe_prompt,
-                target_locales=_target_locales,
-                enable_vad=realtime_enable_vad,
+        rt_col1, rt_col2 = st.columns(2)
+        with rt_col1:
+            realtime_chunk_seconds = st.slider(
+                "Chunk size (seconds)",
+                min_value=1.0,
+                max_value=10.0,
+                value=3.0,
+                step=0.5,
+                key="realtime_chunk_seconds",
+                help="Audio sent per API call. Longer = better accuracy, slower updates.",
             )
-        except ValueError as exc:
-            st.error(str(exc))
-        except RuntimeError as exc:
-            st.error(str(exc))
-        # Normal completion or caught error — reset recording state
-        st.session_state.rt_recording = False
+        with rt_col2:
+            realtime_overlap_seconds = st.slider(
+                "Overlap (seconds)",
+                min_value=0.0,
+                max_value=min(5.0, realtime_chunk_seconds * 0.5),
+                value=min(1.0, realtime_chunk_seconds * 0.5),
+                step=0.5,
+                key="realtime_overlap_seconds",
+                help="Shared audio between consecutive chunks to prevent word loss at boundaries.",
+            )
 
-    # Display previous results if available (persists after stopping)
-    if not st.session_state.rt_recording and st.session_state.rt_results:
-        st.code("\n".join(st.session_state.rt_results), language="text")
+        realtime_enable_vad = st.checkbox(
+            "Skip silent chunks (VAD)",
+            value=True,
+            help=(
+                "Uses voice activity detection to skip silent audio chunks, reducing API calls "
+                "and cost. Requires the `webrtcvad` package; falls back to sending all chunks if not installed."
+            ),
+        )
+
+        # Callback runs BEFORE the rerun — state changes are atomic and can't race.
+        def _on_toggle_click():
+            if st.session_state.rt_recording:
+                # Stop
+                st.session_state.rt_stop_event.set()
+                st.session_state.rt_recording = False
+            else:
+                # Start — create a fresh event and flag recording to begin
+                st.session_state.rt_stop_event = threading.Event()
+                st.session_state.rt_recording = True
+                st.session_state.rt_results = []
+                st.session_state.rt_should_start = True
+
+        toggle_label = "Stop transcription" if st.session_state.rt_recording else "Start transcription"
+        st.button(toggle_label, type="primary", on_click=_on_toggle_click)
+
+        # After the callback-triggered rerun, rt_should_start is True → run recording
+        if st.session_state.rt_should_start:
+            st.session_state.rt_should_start = False
+            try:
+                _run_realtime_mai_transcription(
+                    locale=transcribe_language,
+                    chunk_seconds=realtime_chunk_seconds,
+                    overlap_seconds=realtime_overlap_seconds,
+                    stop_event=st.session_state.rt_stop_event,
+                    task=transcribe_task,
+                    prompt=transcribe_prompt,
+                    target_locales=_target_locales,
+                    enable_vad=realtime_enable_vad,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            except RuntimeError as exc:
+                st.error(str(exc))
+            # Normal completion or caught error — reset recording state
+            st.session_state.rt_recording = False
+
+        # Display previous results if available (persists after stopping)
+        if not st.session_state.rt_recording and st.session_state.rt_results:
+            st.code("\n".join(st.session_state.rt_results), language="text")
 
 # ===========================================================================
 # TAB 2 – MAI-Voice-1  (text → speech)
@@ -1106,6 +1147,31 @@ with tab_voice:
                         data=ssml.encode("utf-8"),
                         timeout=60,
                     )
+
+                    # Retry with Entra if key auth is disabled on the Speech resource
+                    if (
+                        tts_response.status_code in (401, 403)
+                        and tts_headers.get("Ocp-Apim-Subscription-Key")
+                    ):
+                        try:
+                            tts_headers = _build_tts_headers(
+                                "",
+                                output_format,
+                                foundry_tenant_id,
+                                speech_resource_id,
+                            )
+                            tts_response = requests.post(
+                                tts_endpoint,
+                                headers=tts_headers,
+                                data=ssml.encode("utf-8"),
+                                timeout=60,
+                            )
+                        except (ValueError, RuntimeError) as retry_exc:
+                            st.error(
+                                f"Key auth returned {tts_response.status_code} and Entra fallback failed: {retry_exc}"
+                            )
+                            st.stop()
+
                     tts_response.raise_for_status()
 
                     audio_bytes = tts_response.content
@@ -1164,6 +1230,10 @@ with tab_image:
     with col2:
         num_images = st.slider("Number of images", min_value=1, max_value=4, value=1)
 
+    # Persistent gallery across generations
+    if "image_gallery" not in st.session_state:
+        st.session_state.image_gallery = []  # list of (img_bytes, prompt, index)
+
     if st.button("Generate Image", type="primary"):
         if not openai_endpoint or not openai_deployment:
             st.error(
@@ -1221,32 +1291,24 @@ with tab_image:
                         st.success(
                             f"Generated {len(images_data)} image(s) successfully!"
                         )
-                        cols = st.columns(min(len(images_data), 2))
                         for idx, img_data in enumerate(images_data):
-                            col = cols[idx % len(cols)]
-                            with col:
-                                image_url = img_data.get("url")
-                                b64_data = img_data.get("b64_json")
+                            image_url = img_data.get("url")
+                            b64_data = img_data.get("b64_json")
 
-                                if image_url:
-                                    img_bytes_resp = requests.get(
-                                        image_url, timeout=60
-                                    )
-                                    img_bytes = img_bytes_resp.content
-                                elif b64_data:
-                                    img_bytes = base64.b64decode(b64_data)
-                                else:
-                                    st.warning(f"Image {idx + 1}: no URL or data.")
-                                    continue
-
-                                image = Image.open(io.BytesIO(img_bytes))
-                                st.image(image, caption=f"Image {idx + 1}", use_container_width=True)
-                                st.download_button(
-                                    label=f"⬇️ Download image {idx + 1}",
-                                    data=img_bytes,
-                                    file_name=f"mai-image-2-{idx + 1}.png",
-                                    mime="image/png",
+                            if image_url:
+                                img_bytes_resp = requests.get(
+                                    image_url, timeout=60
                                 )
+                                img_bytes = img_bytes_resp.content
+                            elif b64_data:
+                                img_bytes = base64.b64decode(b64_data)
+                            else:
+                                st.warning(f"Image {idx + 1}: no URL or data.")
+                                continue
+
+                            st.session_state.image_gallery.append(
+                                (img_bytes, image_prompt[:80], len(st.session_state.image_gallery) + 1)
+                            )
 
                 except requests.HTTPError as exc:
                     st.error(
@@ -1254,3 +1316,23 @@ with tab_image:
                     )
                 except Exception as exc:
                     st.error(f"Unexpected error: {exc}")
+
+    # -- Persistent image gallery --
+    if st.session_state.image_gallery:
+        st.divider()
+        st.subheader("🖼️ Image Gallery")
+        gallery_cols = st.columns(3)
+        for i, (img_bytes, prompt_text, img_num) in enumerate(st.session_state.image_gallery):
+            with gallery_cols[i % 3]:
+                image = Image.open(io.BytesIO(img_bytes))
+                st.image(image, caption=f"#{img_num}: {prompt_text}", width=300)
+                st.download_button(
+                    label=f"⬇️ Download #{img_num}",
+                    data=img_bytes,
+                    file_name=f"mai-image-2-{img_num}.png",
+                    mime="image/png",
+                    key=f"dl_gallery_{img_num}",
+                )
+        if st.button("Clear gallery"):
+            st.session_state.image_gallery = []
+            st.rerun()

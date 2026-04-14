@@ -1747,9 +1747,9 @@ with tab_image:
     if st.session_state.image_gallery:
         st.divider()
         st.subheader("🖼️ Image Gallery")
-        gallery_cols = st.columns(3)
+        gallery_cols = st.columns(6)
         for i, (img_bytes, prompt_text, img_num) in enumerate(st.session_state.image_gallery):
-            with gallery_cols[i % 3]:
+            with gallery_cols[i % 6]:
                 st.image(img_bytes, caption=f"#{img_num}: {prompt_text}", width="stretch", output_format="PNG")
                 st.download_button(
                     label=f"⬇️ Download #{img_num}",

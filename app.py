@@ -388,6 +388,8 @@ def _run_realtime_mai_transcription(
     tc_model: str = "",
     tc_system: str = "",
     tc_frequency: int = 5,
+    expanded_raw: bool = False,
+    expanded_cleaned: bool = False,
 ) -> None:
     """Continuously record audio via a persistent InputStream and transcribe
     micro-batches via the MAI-Transcribe-1 REST API. The microphone stays open
@@ -441,16 +443,21 @@ def _run_realtime_mai_transcription(
     prompt_placeholder = st.empty()
 
     # Side-by-side transcript layout when cleanup is enabled
+    _scroll_h = None if expanded_raw else _SCROLL_HEIGHT
+    _scroll_h_clean = None if expanded_cleaned else _SCROLL_HEIGHT
     if tc_enabled:
         _raw_col, _clean_col = st.columns(2)
         with _raw_col:
             st.caption("📝 Raw Transcript")
-            transcript_placeholder = st.empty()
+            _raw_scroll = st.container(height=_scroll_h) if _scroll_h else st.container()
+            transcript_placeholder = _raw_scroll.empty()
         with _clean_col:
             st.caption("🧹 Cleaned Transcript")
-            cleaned_placeholder = st.empty()
+            _clean_scroll = st.container(height=_scroll_h_clean) if _scroll_h_clean else st.container()
+            cleaned_placeholder = _clean_scroll.empty()
     else:
-        transcript_placeholder = st.empty()
+        _raw_scroll = st.container(height=_scroll_h) if _scroll_h else st.container()
+        transcript_placeholder = _raw_scroll.empty()
         cleaned_placeholder = st.empty()
 
     # Show initial AI prompt assistant status
@@ -477,6 +484,9 @@ def _run_realtime_mai_transcription(
     ai_prompt_future = None
     tc_future = None
     last_tc_batch = 0
+    # Incremental cleanup: track which result indices have already been cleaned
+    tc_cleaned_up_to = 0  # number of result lines already finalized
+    tc_finalized_parts: list[str] = []  # cleaned paragraphs accumulated so far
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
     overlap_frames = int(min(overlap_seconds, chunk_seconds * 0.5) * SAMPLE_RATE)
     # stride_frames is the NEW audio per chunk; the rest is overlap from the previous chunk
@@ -632,24 +642,31 @@ def _run_realtime_mai_transcription(
                 try:
                     cleaned = tc_future.result()
                     if cleaned:
-                        st.session_state.tc_cleaned = cleaned
-                        cleaned_placeholder.markdown(cleaned)
+                        tc_finalized_parts.append(cleaned)
+                        # Mark the lines we just cleaned as finalized
+                        all_lines = [t for t in results.values() if t]
+                        tc_cleaned_up_to = len(all_lines)
+                        full_cleaned = "\n\n".join(tc_finalized_parts)
+                        st.session_state.tc_cleaned = full_cleaned
+                        cleaned_placeholder.markdown(full_cleaned)
                 except Exception:
                     pass
                 tc_future = None
 
-            # --- Transcript Cleanup: submit new cleanup request (non-blocking) ---
+            # --- Transcript Cleanup: submit only NEW uncleaned lines ---
             if (
                 tc_enabled
                 and tc_model
                 and tc_future is None
                 and batch_idx - last_tc_batch >= tc_frequency
             ):
-                transcript_text_for_cleanup = "\n".join(t for t in results.values() if t)
-                if transcript_text_for_cleanup.strip():
+                all_lines = [t for t in results.values() if t]
+                new_lines = all_lines[tc_cleaned_up_to:]
+                new_text = "\n".join(new_lines)
+                if new_text.strip():
                     tc_future = pool.submit(
                         _cleanup_transcript,
-                        transcript_text_for_cleanup,
+                        new_text,
                         tc_system,
                         tc_model,
                         openai_endpoint,
@@ -845,6 +862,9 @@ def _build_tts_headers(
 
     headers["Authorization"] = f"Bearer aad#{normalized_resource_id}#{entra_token}"
     return headers
+
+
+_SCROLL_HEIGHT = 400  # default height (px) for scrollable transcript containers
 
 
 # ---------------------------------------------------------------------------
@@ -1431,6 +1451,22 @@ with tab_transcribe:
                     key="tc_system_prompt_input",
                 )
 
+        _expand_col1, _expand_col2 = st.columns(2)
+        with _expand_col1:
+            rt_expand_raw = st.checkbox(
+                "Expand raw transcript (no height limit)",
+                value=False,
+                disabled=_is_recording,
+                key="rt_expand_raw",
+            )
+        with _expand_col2:
+            rt_expand_cleaned = st.checkbox(
+                "Expand cleaned transcript (no height limit)",
+                value=False,
+                disabled=_is_recording,
+                key="rt_expand_cleaned",
+            )
+
         # Callback runs BEFORE the rerun — state changes are atomic and can't race.
         def _on_toggle_click():
             if st.session_state.rt_recording:
@@ -1468,6 +1504,8 @@ with tab_transcribe:
                     tc_model=st.session_state.tc_model,
                     tc_system=st.session_state.tc_system_prompt,
                     tc_frequency=st.session_state.tc_frequency,
+                    expanded_raw=st.session_state.get("rt_expand_raw", False),
+                    expanded_cleaned=st.session_state.get("rt_expand_cleaned", False),
                 )
             except ValueError as exc:
                 st.error(str(exc))
@@ -1478,16 +1516,23 @@ with tab_transcribe:
 
         # Display previous results if available (persists after stopping)
         if not st.session_state.rt_recording and st.session_state.rt_results:
+            _post_expand_raw = st.session_state.get("rt_expand_raw", False)
+            _post_expand_cleaned = st.session_state.get("rt_expand_cleaned", False)
+            _post_h = None if _post_expand_raw else _SCROLL_HEIGHT
+            _post_h_clean = None if _post_expand_cleaned else _SCROLL_HEIGHT
             if st.session_state.tc_enabled and st.session_state.tc_cleaned:
                 raw_col, clean_col = st.columns(2)
                 with raw_col:
                     st.caption("📝 Raw Transcript")
-                    st.code("\n".join(st.session_state.rt_results), language="text")
+                    with st.container(height=_post_h) if _post_h else st.container():
+                        st.code("\n".join(st.session_state.rt_results), language="text")
                 with clean_col:
                     st.caption("🧹 Cleaned Transcript")
-                    st.markdown(st.session_state.tc_cleaned)
+                    with st.container(height=_post_h_clean) if _post_h_clean else st.container():
+                        st.markdown(st.session_state.tc_cleaned)
             else:
-                st.code("\n".join(st.session_state.rt_results), language="text")
+                with st.container(height=_post_h) if _post_h else st.container():
+                    st.code("\n".join(st.session_state.rt_results), language="text")
 
 # ===========================================================================
 # TAB 2 – MAI-Voice-1  (text → speech)

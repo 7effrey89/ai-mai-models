@@ -28,6 +28,10 @@ At the right side im reading a random text passage for testing the quality. Qual
 ### Transcribe a recording with prompt support to provide context with MAI-Transcribe-1
 <img width="1235" height="707" alt="image" src="https://github.com/user-attachments/assets/70241f2a-870d-4aa9-8044-8d5224068989" />
 
+Control how much of the transcribed output to post process. Enables better paragraphs seperation and minimize cost instead of submitting the whole transcript but onlt the recent chuncks
+<img width="1012" height="693" alt="image" src="https://github.com/user-attachments/assets/6cdfaf84-ae49-4f36-a821-d28854294526" />
+
+
 ### Voice Mode (Text to Voice) with MAI-Voice-1
 <img width="2484" height="1419" alt="image" src="https://github.com/user-attachments/assets/998e1f7b-d5b6-4721-a2ea-230cdcdf35f2" />
 

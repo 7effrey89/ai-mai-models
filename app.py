@@ -1746,6 +1746,25 @@ with tab_image:
     # -- Persistent image gallery --
     if st.session_state.image_gallery:
         st.divider()
+        st.markdown(
+            """
+            <style>
+            /* In fullscreen mode, shrink the image wrapper to fit the image
+               so the toolbar (close) button aligns with the image's right edge */
+            [data-testid="stFullScreenFrame"] > div {
+                width: fit-content !important;
+                max-width: 100% !important;
+            }
+            [data-testid="stFullScreenFrame"] [data-testid="stImage"] img {
+                width: auto !important;
+                max-width: 90vw !important;
+                max-height: 85vh !important;
+                object-fit: contain !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         st.subheader("🖼️ Image Gallery")
         gallery_cols = st.columns(6)
         for i, (img_bytes, prompt_text, img_num) in enumerate(st.session_state.image_gallery):

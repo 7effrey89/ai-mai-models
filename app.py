@@ -1690,32 +1690,34 @@ with tab_image:
                 payload = {
                     "model": openai_deployment,
                     "prompt": image_prompt,
-                    "n": num_images,
+                    "n": 1,
                     "width": width,
                     "height": height,
                 }
 
                 try:
                     img_start = time.monotonic()
-                    img_response = requests.post(
-                        url,
-                        headers=headers,
-                        json=payload,
-                        timeout=120,
-                    )
-                    img_response.raise_for_status()
+                    all_images_data = []
+                    for req_idx in range(num_images):
+                        img_response = requests.post(
+                            url,
+                            headers=headers,
+                            json=payload,
+                            timeout=120,
+                        )
+                        img_response.raise_for_status()
+                        result = img_response.json()
+                        all_images_data.extend(result.get("data", []))
                     img_elapsed = time.monotonic() - img_start
-                    result = img_response.json()
 
-                    images_data = result.get("data", [])
-                    if not images_data:
+                    if not all_images_data:
                         st.warning("No images were returned. Raw response:")
                         st.json(result)
                     else:
                         st.success(
-                            f"Generated {len(images_data)} image(s) successfully! Latency: {img_elapsed:.2f}s"
+                            f"Generated {len(all_images_data)} image(s) successfully! Latency: {img_elapsed:.2f}s"
                         )
-                        for idx, img_data in enumerate(images_data):
+                        for idx, img_data in enumerate(all_images_data):
                             image_url = img_data.get("url")
                             b64_data = img_data.get("b64_json")
 
@@ -1748,8 +1750,7 @@ with tab_image:
         gallery_cols = st.columns(3)
         for i, (img_bytes, prompt_text, img_num) in enumerate(st.session_state.image_gallery):
             with gallery_cols[i % 3]:
-                image = Image.open(io.BytesIO(img_bytes))
-                st.image(image, caption=f"#{img_num}: {prompt_text}", width=300)
+                st.image(img_bytes, caption=f"#{img_num}: {prompt_text}", width="stretch", output_format="PNG")
                 st.download_button(
                     label=f"⬇️ Download #{img_num}",
                     data=img_bytes,

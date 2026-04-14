@@ -388,6 +388,7 @@ def _run_realtime_mai_transcription(
     tc_model: str = "",
     tc_system: str = "",
     tc_frequency: int = 5,
+    tc_overlap_cycles: int = 2,
     expanded_raw: bool = False,
     expanded_cleaned: bool = False,
 ) -> None:
@@ -484,9 +485,14 @@ def _run_realtime_mai_transcription(
     ai_prompt_future = None
     tc_future = None
     last_tc_batch = 0
-    # Incremental cleanup: track which result indices have already been cleaned
-    tc_cleaned_up_to = 0  # number of result lines already finalized
-    tc_finalized_parts: list[str] = []  # cleaned paragraphs accumulated so far
+    # Incremental cleanup with overlap:
+    # - tc_finalized_parts: cleaned paragraphs that are fully locked in
+    # - tc_pending_cleaned: the most recent cleaned text (may be re-cleaned with new lines)
+    # - tc_pending_raw_start: index into result lines where tc_pending_cleaned starts
+    # - tc_submitted_up_to: how many result lines were included in the last submission
+    tc_finalized_parts: list[str] = []
+    tc_pending_parts: list[tuple[str, int]] = []  # list of (cleaned_text, raw_start_index)
+    tc_submitted_up_to: int = 0
     chunk_frames = int(chunk_seconds * SAMPLE_RATE)
     overlap_frames = int(min(overlap_seconds, chunk_seconds * 0.5) * SAMPLE_RATE)
     # stride_frames is the NEW audio per chunk; the rest is overlap from the previous chunk
@@ -642,18 +648,26 @@ def _run_realtime_mai_transcription(
                 try:
                     cleaned = tc_future.result()
                     if cleaned:
-                        tc_finalized_parts.append(cleaned)
-                        # Mark the lines we just cleaned as finalized
-                        all_lines = [t for t in results.values() if t]
-                        tc_cleaned_up_to = len(all_lines)
-                        full_cleaned = "\n\n".join(tc_finalized_parts)
+                        # Add new result to the pending buffer
+                        tc_pending_parts.append((cleaned, tc_submitted_up_to))
+
+                        # Finalize oldest pending parts once we exceed the overlap window
+                        while len(tc_pending_parts) > tc_overlap_cycles:
+                            finalized_text, _ = tc_pending_parts.pop(0)
+                            tc_finalized_parts.append(finalized_text)
+
+                        # Display: finalized parts + latest pending result
+                        display_parts = list(tc_finalized_parts)
+                        if tc_pending_parts:
+                            display_parts.append(tc_pending_parts[-1][0])
+                        full_cleaned = "\n\n".join(display_parts)
                         st.session_state.tc_cleaned = full_cleaned
                         cleaned_placeholder.markdown(full_cleaned)
                 except Exception:
                     pass
                 tc_future = None
 
-            # --- Transcript Cleanup: submit only NEW uncleaned lines ---
+            # --- Transcript Cleanup: submit pending overlap + new lines ---
             if (
                 tc_enabled
                 and tc_model
@@ -661,12 +675,19 @@ def _run_realtime_mai_transcription(
                 and batch_idx - last_tc_batch >= tc_frequency
             ):
                 all_lines = [t for t in results.values() if t]
-                new_lines = all_lines[tc_cleaned_up_to:]
-                new_text = "\n".join(new_lines)
-                if new_text.strip():
+                # Re-send from the oldest pending part's raw start so the LLM
+                # can merge across batch boundaries.
+                if tc_pending_parts:
+                    overlap_start = tc_pending_parts[0][1]
+                else:
+                    overlap_start = tc_submitted_up_to
+                overlap_and_new = all_lines[overlap_start:]
+                text_to_clean = "\n".join(overlap_and_new)
+                if text_to_clean.strip():
+                    tc_submitted_up_to = len(all_lines)
                     tc_future = pool.submit(
                         _cleanup_transcript,
-                        new_text,
+                        text_to_clean,
                         tc_system,
                         tc_model,
                         openai_endpoint,
@@ -1349,6 +1370,8 @@ with tab_transcribe:
             )
         if "tc_cleaned" not in st.session_state:
             st.session_state.tc_cleaned = ""
+        if "tc_overlap_cycles" not in st.session_state:
+            st.session_state.tc_overlap_cycles = 2
 
         exp_col1, exp_col2 = st.columns(2)
 
@@ -1442,6 +1465,23 @@ with tab_transcribe:
                         key="tc_frequency_slider",
                     )
 
+                tc_col3, tc_col4 = st.columns(2)
+                with tc_col3:
+                    st.session_state.tc_overlap_cycles = st.slider(
+                        "Overlap cycles before finalizing",
+                        min_value=1,
+                        max_value=5,
+                        value=st.session_state.tc_overlap_cycles,
+                        help=(
+                            "How many cleanup cycles the most recent text stays in the pending "
+                            "buffer before being finalized. Higher values let the LLM re-process "
+                            "more context across batch boundaries for smoother paragraphs, but "
+                            "send more text per call."
+                        ),
+                        disabled=_is_recording,
+                        key="tc_overlap_cycles_slider",
+                    )
+
                 st.session_state.tc_system_prompt = st.text_area(
                     "System prompt for cleanup",
                     value=st.session_state.tc_system_prompt,
@@ -1504,6 +1544,7 @@ with tab_transcribe:
                     tc_model=st.session_state.tc_model,
                     tc_system=st.session_state.tc_system_prompt,
                     tc_frequency=st.session_state.tc_frequency,
+                    tc_overlap_cycles=st.session_state.tc_overlap_cycles,
                     expanded_raw=st.session_state.get("rt_expand_raw", False),
                     expanded_cleaned=st.session_state.get("rt_expand_cleaned", False),
                 )
